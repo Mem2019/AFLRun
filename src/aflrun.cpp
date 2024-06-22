@@ -91,15 +91,15 @@ struct AFLRunConfig
 
 	explicit AFLRunConfig() : slow_ctx_bfs(false),
 	check_at_begin(false), log_at_begin(false),
-	log_check_interval(1000 * 60 * 10),
+	log_check_interval(36000),
 	cycle_energy(60 * 10), max_cycle_count(32), check_fringe(false),
 	supp_cnt_thr(100), conf_thr(0.9), count_seed(true), trim_thr(1),
 	linear_cycle_energy(0), exp_ratio(1), favor_high_cov(false),
 	disable_mode{false, false, false, false}, reset_level(1),
-	reset_target(false), no_diversity(false), uni_whole_cycle(false),
+	reset_target(true), no_diversity(false), uni_whole_cycle(false),
 	show_all_seeds(false), init_cov_quant(10 * 60 * 10),
 	col_weight_k(1.0), div_level(1), div_seed_thr(100), trim_col(true),
-	init_cov_reset(3), seed_based_energy(true), assign_ctx(false),
+	init_cov_reset(0), seed_based_energy(true), assign_ctx(false),
 	unite_assign(true), unite_ratio{1, 1, 1, 3}, single_supp_thr(false),
 	dist_k(1), queue_quant_thr(0), min_num_exec(1), uniform_targets(false),
 	extra_cov(false), no_critical(false) {}
