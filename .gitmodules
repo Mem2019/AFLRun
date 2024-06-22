@@ -25,3 +25,6 @@
 [submodule "nyx_mode/packer"]
 	path = nyx_mode/packer
 	url = https://github.com/nyx-fuzz/packer.git
+[submodule "robin-hood-hashing"]
+	path = robin-hood-hashing
+	url = https://github.com/martinus/robin-hood-hashing.git

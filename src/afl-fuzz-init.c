@@ -24,8 +24,12 @@
  */
 
 #include "afl-fuzz.h"
-#include <limits.h>
+#include "aflrun.h"
 #include "cmplog.h"
+#include <limits.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef HAVE_AFFINITY
 
@@ -624,7 +628,7 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
         u32 len = write_to_testcase(afl, (void **)&mem, st.st_size, 1);
         fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
         afl->syncing_party = foreign_name;
-        afl->queued_imported += save_if_interesting(afl, mem, len, fault);
+        afl->queued_imported += save_if_interesting(afl, mem, len, fault, 0);
         afl->syncing_party = 0;
         munmap(mem, st.st_size);
         close(fd);
@@ -655,8 +659,7 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 void read_testcases(afl_state_t *afl, u8 *directory) {
 
   struct dirent **nl;
-  s32             nl_cnt, subdirs = 1;
-  u32             i;
+  s32             i, nl_cnt, subdirs = 1;
   u8             *fn1, *dir = directory;
   u8              val_buf[2][STRINGIFY_VAL_SIZE_MAX];
 
@@ -716,10 +719,7 @@ void read_testcases(afl_state_t *afl, u8 *directory) {
 
   if (nl_cnt) {
 
-    i = nl_cnt;
-    do {
-
-      --i;
+    for (i = 0; i < nl_cnt; ++i) {
 
       struct stat st;
       u8          dfn[PATH_MAX];
@@ -810,7 +810,7 @@ void read_testcases(afl_state_t *afl, u8 *directory) {
 
       */
 
-    } while (i > 0);
+    }
 
   }
 
@@ -1163,7 +1163,7 @@ void perform_dry_run(afl_state_t *afl) {
       struct queue_entry *p = afl->queue_buf[i];
       if (p->disabled || p->cal_failed || !p->exec_cksum) { continue; }
 
-      if (p->exec_cksum == q->exec_cksum) {
+      if (p->exec_cksum == q->exec_cksum && p->path_cksum == q->path_cksum) {
 
         duplicates = 1;
 
@@ -1179,6 +1179,7 @@ void perform_dry_run(afl_state_t *afl) {
           }
 
           p->disabled = 1;
+          aflrun_remove_seed(p->id);
           p->perf_score = 0;
 
         } else {
@@ -1192,6 +1193,7 @@ void perform_dry_run(afl_state_t *afl) {
           }
 
           q->disabled = 1;
+          aflrun_remove_seed(q->id);
           q->perf_score = 0;
 
           done = 1;
@@ -1221,6 +1223,9 @@ void perform_dry_run(afl_state_t *afl) {
   }
 
   OKF("All test cases processed.");
+
+  if (getenv("AFLRUN_TRACE_CORPUS"))
+    exit(0);
 
 }
 
@@ -1813,6 +1818,10 @@ static void handle_existing_out_dir(afl_state_t *afl) {
   if (delete_files(fn, CASE_PREFIX)) { goto dir_cleanup_failed; }
   ck_free(fn);
 
+  fn = alloc_printf("%s/cvx", afl->out_dir);
+  if (delete_files(fn, NULL)) { goto dir_cleanup_failed; }
+  ck_free(fn);
+
   /* And now, for some finishing touches. */
 
   if (afl->file_extension) {
@@ -2024,6 +2033,12 @@ void setup_dirs_fds(afl_state_t *afl) {
   /* All recorded crashes. */
 
   tmp = alloc_printf("%s/crashes", afl->out_dir);
+  if (mkdir(tmp, 0700)) { PFATAL("Unable to create '%s'", tmp); }
+  ck_free(tmp);
+
+  /* All convex optimization information */
+
+  tmp = alloc_printf("%s/cvx", afl->out_dir);
   if (mkdir(tmp, 0700)) { PFATAL("Unable to create '%s'", tmp); }
   ck_free(tmp);
 
@@ -2863,6 +2878,13 @@ void check_binary(afl_state_t *afl, u8 *fname) {
 
   }
 
+  // Load path to AFLRun temporary directory
+  const char* temp_str = memmem(
+    f_data, f_len, AFLRUN_TEMP_SIG, strlen(AFLRUN_TEMP_SIG));
+  if (temp_str == NULL)
+    FATAL("Binary is not compiled from AFLRun compiler.");
+  afl->temp_dir = strdup(temp_str + strlen(AFLRUN_TEMP_SIG));
+
   if (munmap(f_data, f_len)) { PFATAL("unmap() failed"); }
 
 }
@@ -2968,3 +2990,182 @@ void save_cmdline(afl_state_t *afl, u32 argc, char **argv) {
 
 }
 
+/* Initialize AFLRun with the temp dir */
+
+void aflrun_temp_dir_init(afl_state_t* afl, const char* temp_dir) {
+
+  u8* bbr_path = alloc_printf("%s/BBreachable.txt", temp_dir);
+  FILE* fd = fopen(bbr_path, "r");
+  ck_free(bbr_path);
+  if (fd == NULL)
+    FATAL("Failed to open BBreachable.txt");
+  char* line = NULL; size_t len = 0;
+  ssize_t res = getline(&line, &len, fd);
+  if (res == -1 || line == NULL)
+    FATAL("Failed to read BBreachable.txt");
+
+  char* endptr;
+  afl->fsrv.num_targets = strtoul(line, &endptr, 10);
+  if (*endptr != ',')
+    FATAL("Wrong format for BBreachable.txt");
+  *endptr = 0;
+  afl->fsrv.num_reachables = strtoul(endptr + 1, &endptr, 10);
+  if (*endptr != 0 && *endptr != '\n')
+    FATAL("Wrong format for BBreachable.txt");
+
+  if (afl->fsrv.num_targets == 0 ||
+    afl->fsrv.num_targets > afl->fsrv.num_reachables)
+    FATAL("Wrong number of targets and reachables");
+
+  afl->reachable_names = malloc(
+    afl->fsrv.num_reachables * sizeof(char*));
+
+  free(line);
+
+  afl->reachable_to_targets =
+    malloc(afl->fsrv.num_reachables * sizeof(reach_t*));
+  afl->reachable_to_size =
+    malloc(afl->fsrv.num_reachables * sizeof(reach_t));
+  afl->virgin_reachables =
+    malloc(MAP_RBB_SIZE(afl->fsrv.num_reachables));
+  afl->target_weights =
+    malloc(afl->fsrv.num_targets * sizeof(double));
+
+  reach_t next_idx = 0;
+  while (1) {
+    line = NULL; len = 0;
+    res = getline(&line, &len, fd);
+    if (res == -1) {
+      free(line);
+      break;
+    }
+
+    // Parse the line into targets
+    reach_t* buf = malloc(afl->fsrv.num_targets * sizeof(reach_t));
+    reach_t idx = 0;
+    char* iter = strchr(line, ',');
+    if (iter == NULL)
+      FATAL("Wrong format for BBreachable.txt");
+    *iter = 0;
+    afl->reachable_names[next_idx] = strdup(line);
+    ++iter;
+    char* endptr;
+    while (1) {
+      if (idx >= afl->fsrv.num_targets)
+        FATAL("Too many elements in line of BBreachable.txt");
+      reach_t t = strtoul(iter, &endptr, 10);
+      if (t >= afl->fsrv.num_targets)
+        FATAL("Invalid target in line of BBreachable.txt");
+      buf[idx++] = t;
+      if (*endptr != ',')
+        break;
+      iter = endptr + 1;
+    }
+    if (next_idx < afl->fsrv.num_targets) {
+      if (*endptr != '|')
+        FATAL("Need weight for each target");
+      afl->target_weights[next_idx] = strtod(endptr + 1, NULL);
+    }
+
+    if (next_idx >= afl->fsrv.num_reachables)
+      FATAL("Header and countent of BBreachable.txt does not match");
+    afl->reachable_to_size[next_idx] = idx;
+    afl->reachable_to_targets[next_idx++] =
+      realloc(buf, idx * sizeof(reach_t));
+    free(line);
+  }
+  if (next_idx != afl->fsrv.num_reachables)
+    FATAL("Header and countent of BBreachable.txt does not match");
+
+  fclose(fd);
+
+  aflrun_load_freachables(
+    temp_dir, &afl->fsrv.num_ftargets, &afl->fsrv.num_freachables);
+  if (afl->fsrv.num_ftargets == 0 ||
+    afl->fsrv.num_ftargets > afl->fsrv.num_freachables)
+      FATAL("Parsing Freachable.txt failed");
+  afl->virgin_freachables = malloc(
+    MAP_RF_SIZE(afl->fsrv.num_freachables));
+
+  ACTF("Loading edges...");
+  aflrun_load_edges(temp_dir, afl->fsrv.num_reachables);
+  ACTF("Loading distances...");
+  aflrun_load_dists(
+    temp_dir, afl->fsrv.num_targets,
+    afl->fsrv.num_reachables, afl->reachable_names);
+  aflrun_init_groups(afl->fsrv.num_targets);
+
+}
+
+/* Search directory with name `temp_dir` in directory `root`,
+   return its full path if any is found, the returned buffer needs free(). */
+
+static char* search_temp_dir(const char* dir_path, const char* temp_dir) {
+
+  DIR *dir = opendir(dir_path);
+  if (dir == NULL)
+    return NULL;
+
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+
+    char* sub_dir = malloc(PATH_MAX);
+    snprintf(sub_dir, PATH_MAX, "%s/%s", dir_path, entry->d_name);
+
+    struct stat path_stat;
+    if (lstat(sub_dir, &path_stat) != 0) {
+      free(sub_dir);
+      continue;
+    }
+
+    if (S_ISDIR(path_stat.st_mode)) {
+      if (strcmp(entry->d_name, temp_dir) == 0)
+        return sub_dir;
+      char* res = search_temp_dir(sub_dir, temp_dir);
+      if (res) {
+        free(sub_dir);
+        return res;
+      }
+    }
+
+    free(sub_dir);
+
+  }
+
+  closedir(dir);
+  return NULL;
+}
+
+/* Given the temp dir found in the binary, we find its real path.
+  We always return the allocated real path if any is found */
+
+char* aflrun_find_temp(char* temp_dir) {
+
+  size_t len = strlen(temp_dir);
+  if (len == 0) {
+    return NULL;
+  }
+
+  // If the path in the binary is correct, simply use the directory.
+  struct stat path_stat;
+  if (lstat(temp_dir, &path_stat) == 0 && S_ISDIR(path_stat.st_mode))
+    return strdup(temp_dir);
+
+  // Remove the trailing slashes
+  for (char* p = temp_dir + len - 1; *p == '/' || *p == '\\'; --p) *p = 0;
+
+  char* dir_name = strrchr(temp_dir, '/') + 1;
+
+  char pwd[PATH_MAX];
+  if (getcwd(pwd, PATH_MAX) == NULL)
+    FATAL("getcwd() failed");
+
+  // We alternatively find a directory whose name is same as the stored name.
+  // Since the name of temp dir is randomly generated with unlikely collition,
+  // the approach should work properly.
+
+  return search_temp_dir(pwd, dir_name);
+
+}

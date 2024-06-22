@@ -416,6 +416,7 @@ struct custom_mutator *load_custom_mutator_py(afl_state_t *afl,
   if (py_functions[PY_FUNC_DEINIT]) { mutator->afl_custom_deinit = deinit_py; }
 
   if (py_functions[PY_FUNC_FUZZ]) { mutator->afl_custom_fuzz = fuzz_py; }
+  else FATAL("'afl_custom_fuzz' is required");
 
   if (py_functions[PY_FUNC_DESCRIBE]) {
 
@@ -438,6 +439,7 @@ struct custom_mutator *load_custom_mutator_py(afl_state_t *afl,
   if (py_functions[PY_FUNC_FUZZ_COUNT]) {
 
     mutator->afl_custom_fuzz_count = fuzz_count_py;
+    WARNF("AFLRun will ignore afl_custom_fuzz_count");
 
   }
 

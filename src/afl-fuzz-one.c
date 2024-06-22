@@ -24,6 +24,7 @@
  */
 
 #include "afl-fuzz.h"
+#include "aflrun.h"
 #include <string.h>
 #include <limits.h>
 #include "cmplog.h"
@@ -76,7 +77,7 @@ static int select_algorithm(afl_state_t *afl, u32 max_algorithm) {
 static inline u32 choose_block_len(afl_state_t *afl, u32 limit) {
 
   u32 min_value, max_value;
-  u32 rlim = MIN(afl->queue_cycle, (u32)3);
+  u32 rlim = MIN(aflrun_queue_cycle() + 1, (u32)3);
 
   if (unlikely(!afl->run_over10m)) { rlim = 1; }
 
@@ -363,6 +364,72 @@ static void locate_diffs(u8 *ptr1, u8 *ptr2, u32 len, s32 *first, s32 *last) {
 
 #endif                                                     /* !IGNORE_FINDS */
 
+static void log_when_no_tty(afl_state_t *afl) {
+
+  if (unlikely(afl->not_on_tty)) {
+
+    u32 idx = afl->is_aflrun ? afl->aflrun_idx :
+      (afl->old_seed_selection ? afl->current_entry : afl->runs_in_current_cycle);
+
+    ACTF(
+        "Fuzzing test case #%u,%u (%u total, %u disabled, %llu crashes saved, "
+        "perf_score=%0.0f, quant_score=%0.0f, "
+        "exec_us=%llu, hits=%u, map=%u, ascii=%u)...",
+        afl->queue_cur->id, idx,
+        afl->queued_items, afl->queued_extra_disabled, afl->saved_crashes,
+        afl->queue_cur->perf_score, afl->queue_cur->quant_score,
+        afl->queue_cur->exec_us,
+        likely(afl->n_fuzz) ? afl->n_fuzz[afl->queue_cur->n_fuzz_entry] : 0,
+        afl->queue_cur->bitmap_size, afl->queue_cur->is_ascii);
+    static const char mode_c[] = {'C', 'N', 'P', 'T', 'U'};
+    u8 mode = aflrun_get_mode();
+    u64 t = get_cur_time();
+    reach_t num_reached, num_freached;
+    reach_t num_reached_targets, num_freached_targets;
+    size_t div_num_invalid, div_num_fringes;
+    int cycle_count; u32 cov_quant;
+    u64 last_reachable, last_fringe, last_pro_fringe, last_target;
+    u64 last_ctx_reachable, last_ctx_fringe, last_ctx_pro_fringe, last_ctx_target;
+    aflrun_get_reached(
+      &num_reached, &num_freached, &num_reached_targets, &num_freached_targets);
+    aflrun_get_state(
+      &cycle_count, &cov_quant, &div_num_invalid, &div_num_fringes);
+    aflrun_get_time(&last_reachable, &last_fringe, &last_pro_fringe,
+      &last_target, &last_ctx_reachable, &last_ctx_fringe,
+      &last_ctx_pro_fringe, &last_ctx_target);
+    ACTF("%c,%d,%llu,%u %lu/%lu %llu/%llu/%llu/%llu %llu/%llu/%llu/%llu "
+        "%llu/%llu(%llu%%) %llu/%llu(%llu%%) "
+#ifdef AFLRUN_OVERHEAD
+        "%0.02f%%, "
+#endif // AFLRUN_OVERHEAD
+        "%0.02f%%, %0.02f%%, %0.02f%%",
+      mode_c[mode], cycle_count, aflrun_queue_cycle(), cov_quant,
+      div_num_invalid, div_num_fringes,
+      (t - last_reachable) / 1000, (t - last_fringe) / 1000,
+      (t - last_pro_fringe) / 1000, (t - last_target) / 1000,
+      (t - last_ctx_reachable) / 1000, (t - last_ctx_fringe) / 1000,
+      (t - last_ctx_pro_fringe) / 1000, (t - last_ctx_target) / 1000,
+      (u64)num_reached, (u64)afl->fsrv.num_reachables,
+      100uLL * num_reached / afl->fsrv.num_reachables,
+      (u64)num_reached_targets, (u64)afl->fsrv.num_targets,
+      100uLL * num_reached_targets / afl->fsrv.num_targets,
+#ifdef AFLRUN_OVERHEAD
+      (double)afl->fsrv.trace_virgin->overhead * 100 /
+      (afl->exec_time + afl->fuzz_time),
+#endif // AFLRUN_OVERHEAD
+      (double)afl->exec_time * 100 /
+        (afl->exec_time + afl->fuzz_time),
+      (double)afl->exec_time_short * 100 /
+        (afl->exec_time_short + afl->fuzz_time_short),
+        afl->quantum_ratio * 100);
+
+
+    fflush(stdout);
+
+  }
+
+}
+
 /* Take the current entry from the queue, fuzz it for a while. This
    function is a tad too long... returns 0 if fuzzed successfully, 1 if
    skipped or bailed out. */
@@ -374,7 +441,8 @@ u8 fuzz_one_original(afl_state_t *afl) {
   u32 i;
   u8 *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
   u64 havoc_queued = 0, orig_hit_cnt, new_hit_cnt = 0, prev_cksum, _prev_cksum;
-  u32 splice_cycle = 0, perf_score = 100, orig_perf, eff_cnt = 1;
+  u32 splice_cycle = 0, retry_splicing_times, eff_cnt = 1, num_execs = UINT_MAX;
+  double perf_score = 100, orig_perf;
 
   u8 ret_val = 1, doing_det = 0;
 
@@ -407,34 +475,43 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   }
 
-  if (likely(afl->pending_favored)) {
+  if (!afl->is_aflrun) {
 
-    /* If we have any favored, non-fuzzed new arrivals in the queue,
-       possibly skip to them at the expense of already-fuzzed or non-favored
-       cases. */
-
-    if ((afl->queue_cur->fuzz_level || !afl->queue_cur->favored) &&
-        likely(rand_below(afl, 100) < SKIP_TO_NEW_PROB)) {
-
+    // For extra seed from aflrun, we don't fuzz it in coverage mode
+    // unless it is a favored seed
+    if (!afl->queue_cur->favored && afl->queue_cur->aflrun_extra)
       return 1;
 
-    }
+    if (likely(afl->pending_favored)) {
 
-  } else if (!afl->non_instrumented_mode && !afl->queue_cur->favored &&
+      /* If we have any favored, non-fuzzed new arrivals in the queue,
+         possibly skip to them at the expense of already-fuzzed or non-favored
+         cases. */
 
-             afl->queued_items > 10) {
+      if ((afl->queue_cur->fuzz_level || !afl->queue_cur->favored) &&
+          likely(rand_below(afl, 100) < SKIP_TO_NEW_PROB)) {
 
-    /* Otherwise, still possibly skip non-favored cases, albeit less often.
-       The odds of skipping stuff are higher for already-fuzzed inputs and
-       lower for never-fuzzed entries. */
+        return 1;
 
-    if (afl->queue_cycle > 1 && !afl->queue_cur->fuzz_level) {
+      }
 
-      if (likely(rand_below(afl, 100) < SKIP_NFAV_NEW_PROB)) { return 1; }
+    } else if (!afl->non_instrumented_mode && !afl->queue_cur->favored &&
 
-    } else {
+               afl->queued_items > 10) {
 
-      if (likely(rand_below(afl, 100) < SKIP_NFAV_OLD_PROB)) { return 1; }
+      /* Otherwise, still possibly skip non-favored cases, albeit less often.
+         The odds of skipping stuff are higher for already-fuzzed inputs and
+         lower for never-fuzzed entries. */
+
+      if (aflrun_queue_cycle() > 0 && !afl->queue_cur->fuzz_level) {
+
+        if (likely(rand_below(afl, 100) < SKIP_NFAV_NEW_PROB)) { return 1; }
+
+      } else {
+
+        if (likely(rand_below(afl, 100) < SKIP_NFAV_OLD_PROB)) { return 1; }
+
+      }
 
     }
 
@@ -442,18 +519,7 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
 #endif                                                     /* ^IGNORE_FINDS */
 
-  if (unlikely(afl->not_on_tty)) {
-
-    ACTF(
-        "Fuzzing test case #%u (%u total, %llu crashes saved, "
-        "perf_score=%0.0f, exec_us=%llu, hits=%u, map=%u, ascii=%u)...",
-        afl->current_entry, afl->queued_items, afl->saved_crashes,
-        afl->queue_cur->perf_score, afl->queue_cur->exec_us,
-        likely(afl->n_fuzz) ? afl->n_fuzz[afl->queue_cur->n_fuzz_entry] : 0,
-        afl->queue_cur->bitmap_size, afl->queue_cur->is_ascii);
-    fflush(stdout);
-
-  }
+  log_when_no_tty(afl);
 
   orig_in = in_buf = queue_testcase_get(afl, afl->queue_cur);
   len = afl->queue_cur->len;
@@ -478,7 +544,7 @@ u8 fuzz_one_original(afl_state_t *afl) {
       afl->queue_cur->exec_cksum = 0;
 
       res =
-          calibrate_case(afl, afl->queue_cur, in_buf, afl->queue_cycle - 1, 0);
+          calibrate_case(afl, afl->queue_cur, in_buf, aflrun_queue_cycle(), 0);
 
       if (unlikely(res == FSRV_RUN_ERROR)) {
 
@@ -502,7 +568,9 @@ u8 fuzz_one_original(afl_state_t *afl) {
    ************/
 
   if (unlikely(!afl->non_instrumented_mode && !afl->queue_cur->trim_done &&
-               !afl->disable_trim)) {
+               !afl->disable_trim && (!afl->is_aflrun ||
+                 // In aflrun mode, we only trim when quant is large enough
+                 afl->queue_cur->quant_score > afl->trim_thr))) {
 
     u32 old_len = afl->queue_cur->len;
 
@@ -538,8 +606,25 @@ u8 fuzz_one_original(afl_state_t *afl) {
   /*********************
    * PERFORMANCE SCORE *
    *********************/
+  if (likely(afl->is_aflrun)) {
+    orig_perf = perf_score = afl->queue_cur->quant_score;
+    // num_execs = 0.1s * (1 / exec_us) * quantum
+    num_execs = QUANTUM_TIME * perf_score / afl->queue_cur->exec_us;
 
-  if (likely(!afl->old_seed_selection))
+    // If num_execs is smaller than minimum threthold:
+    if (num_execs < afl->min_num_exec) {
+
+      // for prob num_execs/afl->min_num_exec, we execute for min_num_exec times.
+      if (rand_below(afl, afl->min_num_exec) < num_execs)
+        num_execs = afl->min_num_exec;
+      else // otherwise, we skip
+        goto abandon_entry;
+      // In this way, we the expected number of execution can be num_execs.
+
+    }
+
+  }
+  else if (likely(!afl->old_seed_selection))
     orig_perf = perf_score = afl->queue_cur->perf_score;
   else
     afl->queue_cur->perf_score = orig_perf = perf_score =
@@ -1906,15 +1991,37 @@ custom_mutator_stage:
 
   if (likely(!afl->custom_mutators_count)) { goto havoc_stage; }
 
-  afl->stage_name = "custom mutator";
-  afl->stage_short = "custom";
-  afl->stage_max = HAVOC_CYCLES * perf_score / afl->havoc_div / 100;
+  if (afl->is_aflrun) {
+
+    afl->stage_name = "run-custom";
+    afl->stage_short = "run-custom";
+    if (afl->custom_only) {
+      afl->stage_max = num_execs / afl->custom_mutators_count;
+      num_execs = 0;
+    }
+    else {
+      afl->stage_max = AFLRUN_CUSTOM_TIMES(num_execs, afl->custom_mutators_count);
+      // Leave remaining counts to havoc and splice
+      num_execs -= afl->stage_max * afl->custom_mutators_count;
+    }
+
+  }
+  else {
+
+    afl->stage_name = "custom mutator";
+    afl->stage_short = "custom";
+    afl->stage_max = HAVOC_CYCLES * perf_score / afl->havoc_div / 100;
+
+  }
   afl->stage_val_type = STAGE_VAL_NONE;
   bool has_custom_fuzz = false;
 
-  if (afl->stage_max < HAVOC_MIN) { afl->stage_max = HAVOC_MIN; }
+  if (afl->stage_max < HAVOC_MIN && !afl->is_aflrun) {
+    afl->stage_max = HAVOC_MIN;
+  }
 
-  const u32 max_seed_size = MAX_FILE, saved_max = afl->stage_max;
+  const u32 max_seed_size = MAX_FILE;
+  u32 saved_max = afl->stage_max;
 
   orig_hit_cnt = afl->queued_items + afl->saved_crashes;
 
@@ -1924,103 +2031,112 @@ custom_mutator_stage:
 
   LIST_FOREACH(&afl->custom_mutator_list, struct custom_mutator, {
 
-    if (el->afl_custom_fuzz) {
+    afl->current_custom_fuzz = el;
 
-      afl->current_custom_fuzz = el;
+    if (el->afl_custom_fuzz_count) {
 
-      if (el->afl_custom_fuzz_count) {
-
-        afl->stage_max = el->afl_custom_fuzz_count(el->data, out_buf, len);
-
-      } else {
-
+      // Some custom mutator will do some initialization at afl_custom_fuzz_count,
+      // so we always call it but in aflrun mode we don't care its return value.
+      u32 tmp_max = el->afl_custom_fuzz_count(el->data, out_buf, len, saved_max);
+      if (afl->is_aflrun)
         afl->stage_max = saved_max;
+      else
+        afl->stage_max = tmp_max;
 
-      }
+    } else {
 
-      has_custom_fuzz = true;
+      afl->stage_max = saved_max;
 
-      afl->stage_short = el->name_short;
+    }
 
-      if (afl->stage_max) {
+    has_custom_fuzz = true;
 
-        for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max;
-             ++afl->stage_cur) {
+    afl->stage_short = el->name_short;
 
-          struct queue_entry *target = NULL;
-          u32                 tid;
-          u8                 *new_buf = NULL;
-          u32                 target_len = 0;
+    if (afl->stage_max) {
 
-          /* check if splicing makes sense yet (enough entries) */
-          if (likely(afl->ready_for_splicing_count > 1)) {
+      for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max;
+           ++afl->stage_cur) {
 
-            /* Pick a random other queue entry for passing to external API
-               that has the necessary length */
+        struct queue_entry *target = NULL;
+        u32                 tid;
+        u8                 *new_buf = NULL;
+        u32                 target_len = 0;
 
-            do {
+        /* check if splicing makes sense yet (enough entries) */
+        if (likely(afl->ready_for_splicing_count > 1)) {
 
-              tid = rand_below(afl, afl->queued_items);
+          /* Pick a random other queue entry for passing to external API
+             that has the necessary length */
 
-            } while (unlikely(tid == afl->current_entry ||
+          do {
 
-                              afl->queue_buf[tid]->len < 4));
+            tid = rand_below(afl, afl->queued_items);
 
-            target = afl->queue_buf[tid];
-            afl->splicing_with = tid;
+          } while (unlikely(tid == afl->current_entry ||
+                   afl->queue_buf[tid]->aflrun_extra ||
+                   afl->queue_buf[tid]->len < 4));
 
-            /* Read the additional testcase into a new buffer. */
-            new_buf = queue_testcase_get(afl, target);
-            target_len = target->len;
+          target = afl->queue_buf[tid];
+          afl->splicing_with = tid;
+
+          /* Read the additional testcase into a new buffer. */
+          new_buf = queue_testcase_get(afl, target);
+          target_len = target->len;
+
+        }
+
+        u8 *mutated_buf = NULL;
+
+        size_t mutated_size =
+            el->afl_custom_fuzz(el->data, out_buf, len, &mutated_buf, new_buf,
+                                target_len, max_seed_size);
+
+        if (unlikely(!mutated_buf)) {
+
+          FATAL("Error in custom_fuzz. Size returned: %zu", mutated_size);
+
+        }
+
+        if (mutated_size > 0) {
+
+          if (common_fuzz_stuff(afl, mutated_buf, (u32)mutated_size)) {
+
+            goto abandon_entry;
 
           }
 
-          u8 *mutated_buf = NULL;
+          if (afl->is_aflrun || !el->afl_custom_fuzz_count) {
 
-          size_t mutated_size =
-              el->afl_custom_fuzz(el->data, out_buf, len, &mutated_buf, new_buf,
-                                  target_len, max_seed_size);
+            /* If we're finding new stuff, let's run for a bit longer, limits
+              permitting. */
 
-          if (unlikely(!mutated_buf)) {
+            if (afl->queued_items != havoc_queued) {
 
-            FATAL("Error in custom_fuzz. Size returned: %zu", mutated_size);
+              if (!afl->is_aflrun && perf_score <= afl->havoc_max_mult * 100) {
 
-          }
-
-          if (mutated_size > 0) {
-
-            if (common_fuzz_stuff(afl, mutated_buf, (u32)mutated_size)) {
-
-              goto abandon_entry;
-
-            }
-
-            if (!el->afl_custom_fuzz_count) {
-
-              /* If we're finding new stuff, let's run for a bit longer, limits
-                permitting. */
-
-              if (afl->queued_items != havoc_queued) {
-
-                if (perf_score <= afl->havoc_max_mult * 100) {
-
-                  afl->stage_max *= 2;
-                  perf_score *= 2;
-
-                }
-
-                havoc_queued = afl->queued_items;
+                afl->stage_max *= 2;
+                perf_score *= 2;
 
               }
 
+              havoc_queued = afl->queued_items;
+
             }
 
           }
 
-          /* out_buf may have been changed by the call to custom_fuzz */
-          memcpy(out_buf, in_buf, len);
+          if (aflrun_end_cycle()) {
+            afl->stage_max = afl->stage_cur;
+            saved_max = 0; num_execs = 0;
+            afl->force_cycle_end = 1;
+            orig_perf = perf_score = 0;
+          }
 
         }
+
+        /* out_buf may have been changed by the call to custom_fuzz */
+        memcpy(out_buf, in_buf, len);
 
       }
 
@@ -2059,25 +2175,55 @@ havoc_stage:
   /* The havoc stage mutation code is also invoked when splicing files; if the
      splice_cycle variable is set, generate different descriptions and such. */
 
-  if (!splice_cycle) {
+  if (afl->is_aflrun) {
 
-    afl->stage_name = "havoc";
-    afl->stage_short = "havoc";
-    afl->stage_max = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
-                     perf_score / afl->havoc_div / 100;
+    if (!splice_cycle) {
 
-  } else {
+      afl->stage_name = "run-havoc";
+      afl->stage_short = "run-havoc";
+      if (afl->use_splicing && afl->ready_for_splicing_count > 1 &&
+          afl->queue_cur->len >= 4) {
+        afl->stage_max = AFLRUN_HAVOC_TIMES(num_execs, SPLICE_CYCLES);
+      }
+      else { // If splice is not enabled, assign all executions to havoc
+        afl->stage_max = num_execs;
+      }
 
-    perf_score = orig_perf;
+    }
+    else {
 
-    snprintf(afl->stage_name_buf, STAGE_BUF_SIZE, "splice %u", splice_cycle);
-    afl->stage_name = afl->stage_name_buf;
-    afl->stage_short = "splice";
-    afl->stage_max = SPLICE_HAVOC * perf_score / afl->havoc_div / 100;
+      snprintf(afl->stage_name_buf, STAGE_BUF_SIZE, "run-splice %u", splice_cycle);
+      afl->stage_name = afl->stage_name_buf;
+      afl->stage_short = "run-splice";
 
+      afl->stage_max = AFLRUN_SPLICE_TIMES(num_execs, SPLICE_CYCLES);
+
+    }
+  }
+  else {
+
+    if (!splice_cycle) {
+
+      afl->stage_name = "havoc";
+      afl->stage_short = "havoc";
+      afl->stage_max = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
+                       perf_score / afl->havoc_div / 100;
+
+    } else {
+
+      perf_score = orig_perf;
+
+      snprintf(afl->stage_name_buf, STAGE_BUF_SIZE, "splice %u", splice_cycle);
+      afl->stage_name = afl->stage_name_buf;
+      afl->stage_short = "splice";
+      afl->stage_max = SPLICE_HAVOC * perf_score / afl->havoc_div / 100;
+
+    }
   }
 
-  if (afl->stage_max < HAVOC_MIN) { afl->stage_max = HAVOC_MIN; }
+  if (afl->stage_max < HAVOC_MIN && !afl->is_aflrun) {
+    afl->stage_max = HAVOC_MIN;
+  }
 
   temp_len = len;
 
@@ -2957,11 +3103,21 @@ havoc_stage:
 
     if (afl->queued_items != havoc_queued) {
 
-      if (perf_score <= afl->havoc_max_mult * 100) {
+      // Don't increase perf_score in aflrun mode
+      if (!afl->is_aflrun && perf_score <= afl->havoc_max_mult * 100) {
 
         afl->stage_max *= 2;
         perf_score *= 2;
 
+      }
+
+      // If resetted, we need to skip current cycle;
+      // Note that after this afl->is_aflrun is not updated, which is intended
+      if (aflrun_end_cycle()) {
+        afl->stage_max = afl->stage_cur;
+        num_execs = 0;
+        afl->force_cycle_end = 1;
+        orig_perf = perf_score = 0;
       }
 
       havoc_queued = afl->queued_items;
@@ -3001,9 +3157,10 @@ havoc_stage:
      splices them together at some offset, then relies on the havoc
      code to mutate that blob. */
 
+  retry_splicing_times = 0;
 retry_splicing:
 
-  if (afl->use_splicing && splice_cycle++ < SPLICE_CYCLES &&
+  if (afl->use_splicing && splice_cycle < SPLICE_CYCLES &&
       afl->ready_for_splicing_count > 1 && afl->queue_cur->len >= 4) {
 
     struct queue_entry *target;
@@ -3027,7 +3184,8 @@ retry_splicing:
 
       tid = rand_below(afl, afl->queued_items);
 
-    } while (tid == afl->current_entry || afl->queue_buf[tid]->len < 4);
+    } while (tid == afl->current_entry || afl->queue_buf[tid]->len < 4 ||
+        afl->queue_buf[tid]->aflrun_extra);
 
     /* Get the testcase */
     afl->splicing_with = tid;
@@ -3040,7 +3198,12 @@ retry_splicing:
 
     locate_diffs(in_buf, new_buf, MIN(len, (s64)target->len), &f_diff, &l_diff);
 
-    if (f_diff < 0 || l_diff < 2 || f_diff == l_diff) { goto retry_splicing; }
+    if (f_diff < 0 || l_diff < 2 || f_diff == l_diff) {
+      // If retry happens for `SPLICE_CYCLES` times, we force splice
+      if (retry_splicing_times++ < SPLICE_CYCLES) { goto retry_splicing; }
+      else { f_diff = 0; l_diff = 1; } // Force splice by using fake diff value
+    }
+    ++splice_cycle;
 
     /* Split somewhere between the first and last differing byte. */
 
@@ -3059,7 +3222,7 @@ retry_splicing:
     if (unlikely(!out_buf)) { PFATAL("alloc"); }
     memcpy(out_buf, in_buf, len);
 
-    goto custom_mutator_stage;
+    goto havoc_stage; // We don't want to do custom mutation after splice
 
   }
 
@@ -3113,7 +3276,9 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
   u8 *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
   u64 havoc_queued = 0, orig_hit_cnt, new_hit_cnt = 0, cur_ms_lv, prev_cksum,
       _prev_cksum;
-  u32 splice_cycle = 0, perf_score = 100, orig_perf, eff_cnt = 1;
+  u32 splice_cycle = 0, eff_cnt = 1, retry_splicing_times, num_execs = UINT_MAX;
+  double perf_score = 100, orig_perf;
+  s32 temp_len_puppet;
 
   u8 ret_val = 1, doing_det = 0;
 
@@ -3129,34 +3294,43 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
 
 #else
 
-  if (likely(afl->pending_favored)) {
+  if (!afl->is_aflrun) {
 
-    /* If we have any favored, non-fuzzed new arrivals in the queue,
-       possibly skip to them at the expense of already-fuzzed or non-favored
-       cases. */
-
-    if ((afl->queue_cur->fuzz_level || !afl->queue_cur->favored) &&
-        rand_below(afl, 100) < SKIP_TO_NEW_PROB) {
-
+    // For extra seed from aflrun, we don't fuzz it in coverage mode
+    // unless it is a favored seed
+    if (!afl->queue_cur->favored && afl->queue_cur->aflrun_extra)
       return 1;
 
-    }
+    if (likely(afl->pending_favored)) {
 
-  } else if (!afl->non_instrumented_mode && !afl->queue_cur->favored &&
+      /* If we have any favored, non-fuzzed new arrivals in the queue,
+        possibly skip to them at the expense of already-fuzzed or non-favored
+        cases. */
 
-             afl->queued_items > 10) {
+      if ((afl->queue_cur->fuzz_level || !afl->queue_cur->favored) &&
+          rand_below(afl, 100) < SKIP_TO_NEW_PROB) {
 
-    /* Otherwise, still possibly skip non-favored cases, albeit less often.
-       The odds of skipping stuff are higher for already-fuzzed inputs and
-       lower for never-fuzzed entries. */
+        return 1;
 
-    if (afl->queue_cycle > 1 && !afl->queue_cur->fuzz_level) {
+      }
 
-      if (likely(rand_below(afl, 100) < SKIP_NFAV_NEW_PROB)) { return 1; }
+    } else if (!afl->non_instrumented_mode && !afl->queue_cur->favored &&
 
-    } else {
+              afl->queued_items > 10) {
 
-      if (likely(rand_below(afl, 100) < SKIP_NFAV_OLD_PROB)) { return 1; }
+      /* Otherwise, still possibly skip non-favored cases, albeit less often.
+        The odds of skipping stuff are higher for already-fuzzed inputs and
+        lower for never-fuzzed entries. */
+
+      if (aflrun_queue_cycle() > 0 && !afl->queue_cur->fuzz_level) {
+
+        if (likely(rand_below(afl, 100) < SKIP_NFAV_NEW_PROB)) { return 1; }
+
+      } else {
+
+        if (likely(rand_below(afl, 100) < SKIP_NFAV_OLD_PROB)) { return 1; }
+
+      }
 
     }
 
@@ -3164,13 +3338,7 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
 
 #endif                                                     /* ^IGNORE_FINDS */
 
-  if (afl->not_on_tty) {
-
-    ACTF("Fuzzing test case #%u (%u total, %llu crashes saved)...",
-         afl->current_entry, afl->queued_items, afl->saved_crashes);
-    fflush(stdout);
-
-  }
+  log_when_no_tty(afl);
 
   /* Map the test case into memory. */
   orig_in = in_buf = queue_testcase_get(afl, afl->queue_cur);
@@ -3196,7 +3364,7 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
       afl->queue_cur->exec_cksum = 0;
 
       res =
-          calibrate_case(afl, afl->queue_cur, in_buf, afl->queue_cycle - 1, 0);
+          calibrate_case(afl, afl->queue_cur, in_buf, aflrun_queue_cycle(), 0);
 
       if (res == FSRV_RUN_ERROR) {
 
@@ -3220,7 +3388,9 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
    ************/
 
   if (unlikely(!afl->non_instrumented_mode && !afl->queue_cur->trim_done &&
-               !afl->disable_trim)) {
+               !afl->disable_trim && (!afl->is_aflrun ||
+                 // In aflrun mode, we only trim when quant is large enough
+                 afl->queue_cur->quant_score > afl->trim_thr))) {
 
     u32 old_len = afl->queue_cur->len;
 
@@ -3257,7 +3427,25 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
    * PERFORMANCE SCORE *
    *********************/
 
-  if (likely(!afl->old_seed_selection))
+  if (likely(afl->is_aflrun)) {
+    orig_perf = perf_score = afl->queue_cur->quant_score;
+    // num_execs = 0.1s * (1 / exec_us) * quantum
+    num_execs = QUANTUM_TIME * perf_score / afl->queue_cur->exec_us;
+
+    // If num_execs is smaller than minimum threthold:
+    if (num_execs < afl->min_num_exec) {
+
+      // for prob num_execs/afl->min_num_exec, we execute for min_num_exec times.
+      if (rand_below(afl, afl->min_num_exec) < num_execs)
+        num_execs = afl->min_num_exec;
+      else // otherwise, we skip
+        goto abandon_entry;
+      // In this way, we the expected number of execution can be num_execs.
+
+    }
+
+  }
+  else if (likely(!afl->old_seed_selection))
     orig_perf = perf_score = afl->queue_cur->perf_score;
   else
     orig_perf = perf_score = calculate_score(afl, afl->queue_cur);
@@ -4612,32 +4800,6 @@ skip_extras:
 havoc_stage:
 pacemaker_fuzzing:
 
-  afl->stage_cur_byte = -1;
-
-  /* The havoc stage mutation code is also invoked when splicing files; if the
-     splice_cycle variable is set, generate different descriptions and such. */
-
-  if (!splice_cycle) {
-
-    afl->stage_name = MOpt_globals.havoc_stagename;
-    afl->stage_short = MOpt_globals.havoc_stagenameshort;
-    afl->stage_max = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
-                     perf_score / afl->havoc_div / 100;
-
-  } else {
-
-    perf_score = orig_perf;
-
-    snprintf(afl->stage_name_buf, STAGE_BUF_SIZE,
-             MOpt_globals.splice_stageformat, splice_cycle);
-    afl->stage_name = afl->stage_name_buf;
-    afl->stage_short = MOpt_globals.splice_stagenameshort;
-    afl->stage_max = SPLICE_HAVOC * perf_score / afl->havoc_div / 100;
-
-  }
-
-  s32 temp_len_puppet;
-
   // for (; afl->swarm_now < swarm_num; ++afl->swarm_now)
   {
 
@@ -4668,25 +4830,62 @@ pacemaker_fuzzing:
          the splice_cycle variable is set, generate different descriptions and
          such. */
 
-      if (!splice_cycle) {
+      if (afl->is_aflrun) {
 
-        afl->stage_name = MOpt_globals.havoc_stagename;
-        afl->stage_short = MOpt_globals.havoc_stagenameshort;
-        afl->stage_max = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
-                         perf_score / afl->havoc_div / 100;
+        if (!splice_cycle) {
 
-      } else {
+          snprintf(afl->stage_name_buf, STAGE_BUF_SIZE,
+            "run-%s", MOpt_globals.havoc_stagename);
+          afl->stage_name = afl->stage_name_buf;
+          afl->stage_short = "run-mopt-havoc";
+          if (afl->use_splicing && afl->ready_for_splicing_count > 1 &&
+              afl->queue_cur->len >= 4) {
+            afl->stage_max = AFLRUN_HAVOC_TIMES(num_execs, afl->SPLICE_CYCLES_puppet);
+          }
+          else { // If splice is not enabled, assign all executions to havoc
+            afl->stage_max = num_execs;
+          }
 
-        perf_score = orig_perf;
-        snprintf(afl->stage_name_buf, STAGE_BUF_SIZE,
-                 MOpt_globals.splice_stageformat, splice_cycle);
-        afl->stage_name = afl->stage_name_buf;
-        afl->stage_short = MOpt_globals.splice_stagenameshort;
-        afl->stage_max = SPLICE_HAVOC * perf_score / afl->havoc_div / 100;
+        }
+        else {
+
+          char tmp_buf[STAGE_BUF_SIZE];
+          snprintf(tmp_buf, STAGE_BUF_SIZE,
+                  MOpt_globals.splice_stageformat, splice_cycle);
+          snprintf(afl->stage_name_buf, STAGE_BUF_SIZE, "run-%s", tmp_buf);
+          afl->stage_name = afl->stage_name_buf;
+          afl->stage_short = "run-mopt-splice";
+
+          afl->stage_max = AFLRUN_SPLICE_TIMES(
+            num_execs, afl->SPLICE_CYCLES_puppet);
+
+        }
+      }
+      else {
+
+        if (!splice_cycle) {
+
+          afl->stage_name = MOpt_globals.havoc_stagename;
+          afl->stage_short = MOpt_globals.havoc_stagenameshort;
+          afl->stage_max = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
+                          perf_score / afl->havoc_div / 100;
+
+        } else {
+
+          perf_score = orig_perf;
+          snprintf(afl->stage_name_buf, STAGE_BUF_SIZE,
+                  MOpt_globals.splice_stageformat, splice_cycle);
+          afl->stage_name = afl->stage_name_buf;
+          afl->stage_short = MOpt_globals.splice_stagenameshort;
+          afl->stage_max = SPLICE_HAVOC * perf_score / afl->havoc_div / 100;
+
+        }
 
       }
 
-      if (afl->stage_max < HAVOC_MIN) { afl->stage_max = HAVOC_MIN; }
+      if (afl->stage_max < HAVOC_MIN && !afl->is_aflrun) {
+        afl->stage_max = HAVOC_MIN;
+      }
 
       temp_len = len;
 
@@ -5364,11 +5563,19 @@ pacemaker_fuzzing:
 
         if (afl->queued_items != havoc_queued) {
 
-          if (perf_score <= afl->havoc_max_mult * 100) {
+          // Don't increase perf_score in aflrun mode
+          if (!afl->is_aflrun && perf_score <= afl->havoc_max_mult * 100) {
 
             afl->stage_max *= 2;
             perf_score *= 2;
 
+          }
+
+          if (aflrun_end_cycle()) {
+            afl->stage_max = afl->stage_cur;
+            num_execs = 0;
+            afl->force_cycle_end = 1;
+            orig_perf = perf_score = 0;
           }
 
           havoc_queued = afl->queued_items;
@@ -5443,10 +5650,11 @@ pacemaker_fuzzing:
        * SPLICING *
        ************/
 
+    retry_splicing_times = 0;
     retry_splicing_puppet:
 
       if (afl->use_splicing &&
-          splice_cycle++ < (u32)afl->SPLICE_CYCLES_puppet &&
+          splice_cycle < (u32)afl->SPLICE_CYCLES_puppet &&
           afl->ready_for_splicing_count > 1 && afl->queue_cur->len >= 4) {
 
         struct queue_entry *target;
@@ -5471,7 +5679,8 @@ pacemaker_fuzzing:
 
           tid = rand_below(afl, afl->queued_items);
 
-        } while (tid == afl->current_entry || afl->queue_buf[tid]->len < 4);
+        } while (tid == afl->current_entry || afl->queue_buf[tid]->len < 4 ||
+                  afl->queue_buf[tid]->aflrun_extra);
 
         afl->splicing_with = tid;
         target = afl->queue_buf[tid];
@@ -5487,9 +5696,13 @@ pacemaker_fuzzing:
 
         if (f_diff < 0 || l_diff < 2 || f_diff == l_diff) {
 
-          goto retry_splicing_puppet;
+          if (retry_splicing_times++ < SPLICE_CYCLES) {
+            goto retry_splicing_puppet;
+          }
+          else { f_diff = 0; l_diff = 1; }
 
         }
+        ++splice_cycle;
 
         /* Split somewhere between the first and last differing byte. */
 
@@ -5819,6 +6032,8 @@ u8 fuzz_one(afl_state_t *afl) {
 #endif
 
   // if limit_time_sig == -1 then both are run after each other
+  // therefore we reduce the quant by half so the sum is unchanged
+  if (afl->limit_time_sig < 0) { afl->queue_cur->quant_score /= 2; }
 
   if (afl->limit_time_sig <= 0) { key_val_lv_1 = fuzz_one_original(afl); }
 
@@ -5835,6 +6050,8 @@ u8 fuzz_one(afl_state_t *afl) {
     } else if (afl->key_module == 2) {
 
       pso_updating(afl);
+      // We should not skip this seed after updating PSO.
+      key_val_lv_2 = pilot_fuzzing(afl);
 
     }
 

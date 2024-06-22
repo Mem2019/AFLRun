@@ -13,6 +13,7 @@
 #include <fstream>
 #include <set>
 #include <iostream>
+#include <unordered_set>
 
 #include "llvm/Transforms/Instrumentation/SanitizerCoverage.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -363,6 +364,16 @@ PreservedAnalyses ModuleSanitizerCoverageLTO::run(Module                &M,
 
 }
 
+std::unordered_map<std::string, double> aflrunParseTargets(std::string targets_file);
+bool aflrunPreprocess(
+  Module &M, const std::unordered_map<std::string, double>& targets,
+  size_t& num_rm, char be_quiet, std::string out_directory);
+void aflrunInstrument(
+  Module &M, std::string out_directory);
+void aflrunAddGlobals(Module& M,
+  reach_t num_targets, reach_t num_reachables, reach_t num_freachables);
+
+
 bool ModuleSanitizerCoverageLTO::instrumentModule(
     Module &M, DomTreeCallback DTCallback, PostDomTreeCallback PDTCallback) {
 
@@ -409,18 +420,54 @@ bool ModuleSanitizerCoverageLTO::instrumentModule(
   Int32Tyi = IntegerType::getInt32Ty(Ctx);
   Int64Tyi = IntegerType::getInt64Ty(Ctx);
 
+  /* Load targets for AFLRun */
+  bool is_aflrun = false;
+  std::unordered_map<std::string, double> targets;
+
+  char* out_directory = getenv("AFLRUN_TEMP_DIR");
+  if (out_directory != NULL) {
+    targets = aflrunParseTargets(getenv("AFLRUN_BB_TARGETS"));
+    is_aflrun = true;
+    std::string temp_dir_path(AFLRUN_TEMP_SIG);
+    temp_dir_path += out_directory;
+    new GlobalVariable(M, ArrayType::get(Int8Ty, temp_dir_path.size() + 1), true,
+      GlobalValue::PrivateLinkage, ConstantDataArray::getString(*C, temp_dir_path),
+      "__aflrun_path_to_temp_dir");
+  }
+
   /* Show a banner */
   setvbuf(stdout, NULL, _IONBF, 0);
   if (getenv("AFL_DEBUG")) debug = 1;
 
   if ((isatty(2) && !getenv("AFL_QUIET")) || debug) {
 
-    SAYF(cCYA "afl-llvm-lto" VERSION cRST
-              " by Marc \"vanHauser\" Heuse <mh@mh-sec.de>\n");
+    if (is_aflrun)
+      SAYF(cCYA "aflrun-llvm-lto" VERSION cRST
+                " by Mem2019\n");
+    else
+      SAYF(cCYA "afl-llvm-lto" VERSION cRST
+                " by Marc \"vanHauser\" Heuse <mh@mh-sec.de>\n");
 
   } else
 
     be_quiet = 1;
+
+  if (is_aflrun) {
+    size_t num_rm = 0;
+    bool has_targets = aflrunPreprocess(
+      M, targets, num_rm, be_quiet, out_directory);
+    if (has_targets) {
+      if (!be_quiet)
+        OKF("Removed = %lu", num_rm);
+      aflrunInstrument(M, out_directory);
+    }
+    else {
+      if (!be_quiet)
+        WARNF("No target found, so no AFLRun instrumentation");
+    }
+  } else {
+    aflrunAddGlobals(M, 0, 0, 0);
+  }
 
   skip_nozero = getenv("AFL_LLVM_SKIP_NEVERZERO");
   use_threadsafe_counters = getenv("AFL_LLVM_THREADSAFE_INST");
@@ -1187,6 +1234,10 @@ static bool shouldInstrumentBlock(const Function &F, const BasicBlock *BB,
                                   const DominatorTree            *DT,
                                   const PostDominatorTree        *PDT,
                                   const SanitizerCoverageOptions &Options) {
+
+  // Don't instrument LAF blocks
+  if (BB->getTerminator()->getMetadata(F.getParent()->getMDKindID("laf")))
+    return false;
 
   // Don't insert coverage for blocks containing nothing but unreachable: we
   // will never call __sanitizer_cov() for them, so counting them in

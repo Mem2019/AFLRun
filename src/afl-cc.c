@@ -31,6 +31,8 @@
 #include <strings.h>
 #include <limits.h>
 #include <assert.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #if (LLVM_MAJOR - 0 == 0)
   #undef LLVM_MAJOR
@@ -48,6 +50,8 @@
 static u8  *obj_path;                  /* Path to runtime libraries         */
 static u8 **cc_params;                 /* Parameters passed to the real CC  */
 static u32  cc_par_cnt = 1;            /* Param count, including argv0      */
+static u8*  pwd;
+static u8*  lib_fuzz;
 static u8   clang_mode;                /* Invoked as afl-clang*?            */
 static u8   llvm_fullpath[PATH_MAX];
 static u8   instrument_mode, instrument_opt_mode, ngram_size, ctx_k, lto_mode;
@@ -375,13 +379,96 @@ void parse_fsanitize(char *string) {
 
 }
 
+static const char b64_tab[64] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+static u8* create_temp_dir(const char* target_name) {
+
+  // Generate random directory name
+  FILE* fd = fopen("/dev/urandom", "rb");
+  if (fd == NULL)
+    FATAL("Cannot open urandom");
+  char dir_name[13];
+  u8 tmp;
+  for (size_t i = 0; i < sizeof(dir_name) - 1; ++i) {
+    if (fread(&tmp, 1, 1, fd) != 1)
+      FATAL("fread() failed");
+    dir_name[i] = b64_tab[tmp % sizeof(b64_tab)];
+  }
+  dir_name[sizeof(dir_name) - 1] = 0;
+  fclose(fd);
+
+  // Create directories and files as init of dir
+  const char* tmp_dir = getenv("AFLRUN_TMP");
+  if (tmp_dir && tmp_dir[0] != '/')
+    FATAL("Please use absolute path for AFLRUN_TMP");
+  u8* ret = alloc_printf("%s/%s.%s",
+    tmp_dir ? tmp_dir : "/tmp", target_name, dir_name);
+  if (mkdir(ret, 0700) < 0) FATAL("mkdir() failed");
+  return ret;
+}
+
+static void parse_out(const char* out, u8** dir, u8** name) {
+  if (out == NULL)
+    FATAL("No out file path");
+
+  char* cp = strdup(out);
+
+  u8* pos = strrchr(cp, '/');
+  if (pos == NULL) {
+    *name = cp;
+    *dir = pwd;
+  }
+  else {
+    *pos = 0;
+    *name = pos + 1;
+    if (out[0] == '/')
+      *dir = alloc_printf("/%s", cp);
+    else
+      *dir = alloc_printf("%s/%s", pwd, cp);
+  }
+}
+
+static u8 is_fuzzer(u8* target_name) {
+
+  size_t len = strlen(target_name);
+  // strlen("_fuzzer") == 7 && strlen("fuzz_") == 5
+  return
+    (len >= 7 && memcmp(target_name + len - 7, "_fuzzer", 7) == 0) ||
+    (len >= 5 && memcmp(target_name, "fuzz_", 5) == 0);
+}
+
+static u8 is_target(u8* target_name, u8* targets) {
+
+  // "::" represent we want to treat everything as target
+  if (strcmp(targets, "::") == 0)
+    return 1;
+
+  u8* iter = ck_strdup(targets);
+
+  while (1) {
+
+    u8* p = strchr(iter, ':');
+    if (p == NULL)
+      break;
+
+    *p = 0;
+    if (strcmp(target_name, iter) == 0)
+      return 1;
+
+    iter = p + 1;
+
+  }
+
+  return strcmp(target_name, iter) == 0;
+}
+
+
 /* Copy argv to cc_params, making the necessary edits. */
 
 static void edit_params(u32 argc, char **argv, char **envp) {
 
   u8 fortify_set = 0, asan_set = 0, x_set = 0, bit_mode = 0, shared_linking = 0,
      preprocessor_only = 0, have_unroll = 0, have_o = 0, have_pic = 0,
-     have_c = 0, partial_linking = 0;
+     have_c = 0, partial_linking = 0, lib_fuzz_bin = 0;
 
   cc_params = ck_alloc((argc + 128) * sizeof(u8 *));
 
@@ -585,25 +672,6 @@ static void edit_params(u32 argc, char **argv, char **envp) {
 
     }
 
-    if (getenv("LAF_SPLIT_COMPARES") || getenv("AFL_LLVM_LAF_SPLIT_COMPARES") ||
-        getenv("AFL_LLVM_LAF_SPLIT_FLOATS")) {
-
-#if LLVM_MAJOR >= 11                                /* use new pass manager */
-  #if LLVM_MAJOR < 16
-      cc_params[cc_par_cnt++] = "-fexperimental-new-pass-manager";
-  #endif
-      cc_params[cc_par_cnt++] =
-          alloc_printf("-fpass-plugin=%s/split-compares-pass.so", obj_path);
-#else
-      cc_params[cc_par_cnt++] = "-Xclang";
-      cc_params[cc_par_cnt++] = "-load";
-      cc_params[cc_par_cnt++] = "-Xclang";
-      cc_params[cc_par_cnt++] =
-          alloc_printf("%s/split-compares-pass.so", obj_path);
-#endif
-
-    }
-
     // /laf
 
     unsetenv("AFL_LD");
@@ -645,6 +713,22 @@ static void edit_params(u32 argc, char **argv, char **envp) {
     //    // Use the old pass manager in LLVM 14 which the afl++ passes still
     //    use. cc_params[cc_par_cnt++] = "-flegacy-pass-manager";
     //#endif
+
+    if (lto_mode) {
+
+#if LLVM_MAJOR >= 11                                /* use new pass manager */
+      cc_params[cc_par_cnt++] = "-fexperimental-new-pass-manager";
+      cc_params[cc_par_cnt++] =
+          alloc_printf("-fpass-plugin=%s/lto-marker.so", obj_path);
+#else
+      cc_params[cc_par_cnt++] = "-Xclang";
+      cc_params[cc_par_cnt++] = "-load";
+      cc_params[cc_par_cnt++] = "-Xclang";
+      cc_params[cc_par_cnt++] =
+          alloc_printf("%s/lto-marker.so", obj_path);
+#endif
+
+    }
 
     if (lto_mode && !have_c) {
 
@@ -825,6 +909,7 @@ static void edit_params(u32 argc, char **argv, char **envp) {
   /* Detect stray -v calls from ./configure scripts. */
 
   u8 skip_next = 0, non_dash = 0;
+  u8 *target_path = NULL, *target_name = NULL;
   while (--argc) {
 
     u8 *cur = *(++argv);
@@ -835,6 +920,13 @@ static void edit_params(u32 argc, char **argv, char **envp) {
       continue;
 
     }
+
+    if (!strcmp(cur, "-o")) parse_out(argv[1], &target_path, &target_name);
+
+    // If there is libfuzzer engine environment variable,
+    // we can check command line to see if this is compiling fuzzed binary
+    if (lib_fuzz && !strcmp(cur, lib_fuzz))
+      lib_fuzz_bin = 1;
 
     if (cur[0] != '-') { non_dash = 1; }
     if (!strncmp(cur, "--afl", 5)) continue;
@@ -850,6 +942,9 @@ static void edit_params(u32 argc, char **argv, char **envp) {
     }
 
     if (compiler_mode == GCC_PLUGIN && !strcmp(cur, "-pipe")) { continue; }
+
+    // Disable `-Werror` flag
+    if (!strcmp(cur, "-Werror")) continue;
 
     if (!strcmp(cur, "-z") || !strcmp(cur, "-Wl,-z")) {
 
@@ -970,6 +1065,14 @@ static void edit_params(u32 argc, char **argv, char **envp) {
 
   }
 
+  if (target_path == NULL) {
+    target_path = pwd;
+    target_name = "a.out";
+  }
+
+  cc_params[cc_par_cnt++] = "-g";
+  cc_params[cc_par_cnt++] = "-fno-inline-functions";
+
   // in case LLVM is installed not via a package manager or "make install"
   // e.g. compiled download or compiled from github then its ./lib directory
   // might not be in the search path. Add it if so.
@@ -1066,8 +1169,7 @@ static void edit_params(u32 argc, char **argv, char **envp) {
 
   if (!getenv("AFL_DONT_OPTIMIZE")) {
 
-    cc_params[cc_par_cnt++] = "-g";
-    if (!have_o) cc_params[cc_par_cnt++] = "-O3";
+    if (!have_o) cc_params[cc_par_cnt++] = "-O1";
     if (!have_unroll) cc_params[cc_par_cnt++] = "-funroll-loops";
     // if (strlen(march_opt) > 1 && march_opt[0] == '-')
     //  cc_params[cc_par_cnt++] = march_opt;
@@ -1221,6 +1323,20 @@ static void edit_params(u32 argc, char **argv, char **envp) {
 
   if (compiler_mode != GCC && compiler_mode != CLANG) {
 
+    char* targets = getenv("AFLRUN_TARGETS");
+    if ((targets != NULL && is_target(target_name, targets)) ||
+      lib_fuzz_bin || (lib_fuzz && is_fuzzer(target_name))) {
+      // we use aflrun for all fuzzed binary
+
+      char* bb_targets = getenv("AFLRUN_BB_TARGETS");
+      if (bb_targets == NULL)
+        FATAL("Please set env var 'AFLRUN_BB_TARGETS'");
+      if (getenv("AFLRUN_SAVE_TEMPS"))
+        cc_params[cc_par_cnt++] = "-Wl,-plugin-opt=save-temps";
+      u8* temp_dir = create_temp_dir(target_name);
+      setenv("AFLRUN_TEMP_DIR", temp_dir, 1);
+    }
+
     switch (bit_mode) {
 
       case 0:
@@ -1312,6 +1428,12 @@ int main(int argc, char **argv, char **envp) {
 
   int   i;
   char *callname = argv[0], *ptr = NULL;
+
+  pwd = getenv("PWD");
+  if (pwd == NULL)
+    FATAL("$PWD is not set");
+
+  lib_fuzz = getenv("AFLRUN_NO_OSS") ? NULL : getenv("LIB_FUZZING_ENGINE");
 
   if (getenv("AFL_DEBUG")) {
 
@@ -1988,7 +2110,7 @@ int main(int argc, char **argv, char **envp) {
           "  AFL_CC: path to the C compiler to use\n"
           "  AFL_CXX: path to the C++ compiler to use\n"
           "  AFL_DEBUG: enable developer debugging output\n"
-          "  AFL_DONT_OPTIMIZE: disable optimization instead of -O3\n"
+          "  AFL_DONT_OPTIMIZE: disable optimization instead of -O1\n"
           "  AFL_NO_BUILTIN: no builtins for string compare functions (for "
           "libtokencap.so)\n"
           "  AFL_NOOP: behave like a normal compiler (to pass configure "
@@ -2318,6 +2440,15 @@ int main(int argc, char **argv, char **envp) {
     execvp(cc_params[0], (char **)argv);
 
   } else {
+
+    if (getenv("AFLRUN_SHOW_CLANG_ARGS")) {
+      for (int i = 0; i < argc; ++i)
+        fprintf(stderr, "%s ", argv[i]);
+      fprintf(stderr, "\n");
+      for (u8** i = cc_params; *i; ++i)
+        fprintf(stderr, "%s ", *i);
+      fprintf(stderr, "\n");
+    }
 
     execvp(cc_params[0], (char **)cc_params);
 

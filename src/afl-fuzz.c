@@ -24,10 +24,12 @@
  */
 
 #include "afl-fuzz.h"
+#include "aflrun.h"
 #include "cmplog.h"
 #include "common.h"
 #include <limits.h>
 #include <stdlib.h>
+#include <math.h>
 #ifndef USEMMAP
   #include <sys/mman.h>
   #include <sys/stat.h>
@@ -48,7 +50,9 @@ extern u64 time_spent_working;
 static void at_exit() {
 
   s32   i, pid1 = 0, pid2 = 0, pgrp = -1;
-  char *list[4] = {SHM_ENV_VAR, SHM_FUZZ_ENV_VAR, CMPLOG_SHM_ENV_VAR, NULL};
+  char *list[] = {SHM_ENV_VAR, SHM_FUZZ_ENV_VAR, CMPLOG_SHM_ENV_VAR,
+    SHM_RBB_ENV_VAR, SHM_RF_ENV_VAR, SHM_TR_ENV_VAR, SHM_VIR_ENV_VAR,
+    SHM_VTR_ENV_VAR, NULL};
   char *ptr;
 
   ptr = getenv("__AFL_TARGET_PID2");
@@ -506,9 +510,11 @@ int main(int argc, char **argv_orig, char **envp) {
   u8 *extras_dir[4];
   u8  mem_limit_given = 0, exit_1 = 0, debug = 0,
      extras_dir_cnt = 0 /*, have_p = 0*/;
+  char* aflrun_d = NULL;
   char  *afl_preload;
   char  *frida_afl_preload = NULL;
   char **use_argv;
+  FILE* fd;
 
   struct timeval  tv;
   struct timezone tz;
@@ -532,6 +538,7 @@ int main(int argc, char **argv_orig, char **envp) {
   if (get_afl_env("AFL_DEBUG")) { debug = afl->debug = 1; }
 
   afl_state_init(afl, map_size);
+  afl->last_exec_time = get_cur_time_us();
   afl->debug = debug;
   afl_fsrv_init(&afl->fsrv);
   if (debug) { afl->fsrv.debug = true; }
@@ -549,11 +556,21 @@ int main(int argc, char **argv_orig, char **envp) {
 
   afl->shmem_testcase_mode = 1;  // we always try to perform shmem fuzzing
 
+#define AFLRUN_ARG_DIR 0x101
+#define AFLRUN_ARG_CONF 0x102
+
+  struct option long_options[] = {
+    {"dir", required_argument, NULL, AFLRUN_ARG_DIR},
+    {"config", required_argument, NULL, AFLRUN_ARG_CONF},
+    {0}
+  };
+  const char* config = "";
+
   while (
-      (opt = getopt(
+      (opt = getopt_long(
            argc, argv,
-           "+Ab:B:c:CdDe:E:hi:I:f:F:g:G:l:L:m:M:nNOo:p:RQs:S:t:T:UV:WXx:YZ")) >
-      0) {
+           "+Ab:B:c:CdDe:E:hi:I:f:F:g:G:l:L:m:M:nNOo:p:RQs:S:t:T:UV:WXx:YZ",
+           long_options, NULL)) > 0) {
 
     switch (opt) {
 
@@ -814,6 +831,7 @@ int main(int argc, char **argv_orig, char **envp) {
         }
 
         extras_dir[extras_dir_cnt++] = optarg;
+        setenv("AFL_DICT", optarg, 1); // TODO: let custom mutators parse cmdlines
         break;
 
       case 't': {                                                /* timeout */
@@ -1290,6 +1308,16 @@ int main(int argc, char **argv_orig, char **envp) {
 
         break;
 
+        case AFLRUN_ARG_CONF:
+          config = strdup(optarg);
+          break;
+
+        case AFLRUN_ARG_DIR: /* Argument to receive temp directory */
+          if (aflrun_d)
+            FATAL("Please only provide one --dir argument");
+          aflrun_d = strdup(optarg);
+          break;
+
       default:
         if (!show_help) { show_help = 1; }
 
@@ -1297,11 +1325,21 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+#undef AFLRUN_ARG_DIR
+#undef AFLRUN_ARG_CONF
+
   if (optind == argc || !afl->in_dir || !afl->out_dir || show_help) {
 
     usage(argv[0], show_help);
 
   }
+
+  if (!afl->skip_deterministic)
+    FATAL("Please use -d for AFLRUN to skip deterministic fuzzing");
+
+  if (afl->old_seed_selection)
+    WARNF("Old seed selection is enabled; "
+      "this is supported but might cause bias. TODO: fix");
 
   if (unlikely(afl->afl_env.afl_persistent_record)) {
 
@@ -1958,6 +1996,19 @@ int main(int argc, char **argv_orig, char **envp) {
 
   check_binary(afl, argv[optind]);
 
+  aflrun_d = aflrun_d != NULL ? aflrun_d : aflrun_find_temp(afl->temp_dir);
+  if (aflrun_d == NULL)
+    FATAL("Cannot find temp dir, please provide '--dir' manually");
+  OKF("Path to AFLRun directory: %s", aflrun_d);
+  aflrun_temp_dir_init(afl, aflrun_d);
+  free(aflrun_d);
+
+  aflrun_load_config(config,
+    &afl->check_at_begin, &afl->log_at_begin, &afl->log_check_interval,
+    &afl->trim_thr, &afl->queue_quant_thr, &afl->min_num_exec);
+  aflrun_init_fringes(
+    afl->fsrv.num_reachables, afl->fsrv.num_targets);
+
   #ifdef AFL_PERSISTENT_RECORD
   if (unlikely(afl->fsrv.persistent_record)) {
 
@@ -2023,6 +2074,14 @@ int main(int argc, char **argv_orig, char **envp) {
   afl->argv = use_argv;
   afl->fsrv.trace_bits =
       afl_shm_init(&afl->shm, afl->fsrv.map_size, afl->non_instrumented_mode);
+  aflrun_shm_init(&afl->shm_run, afl->fsrv.num_reachables,
+    afl->fsrv.num_freachables, afl->non_instrumented_mode);
+  afl->fsrv.trace_reachables = afl->shm_run.map_reachables;
+  afl->fsrv.trace_freachables = afl->shm_run.map_freachables;
+  afl->fsrv.trace_ctx = afl->shm_run.map_ctx;
+  afl->virgin_ctx = afl->shm_run.map_virgin_ctx;
+  afl->fsrv.trace_virgin = afl->shm_run.map_new_blocks;
+  afl->fsrv.trace_targets = afl->shm_run.map_targets;
 
   if (!afl->non_instrumented_mode && !afl->fsrv.qemu_mode &&
       !afl->unicorn_mode && !afl->fsrv.frida_mode && !afl->fsrv.cs_mode &&
@@ -2184,6 +2243,16 @@ int main(int argc, char **argv_orig, char **envp) {
 
   memset(afl->virgin_tmout, 255, map_size);
   memset(afl->virgin_crash, 255, map_size);
+  memset(afl->virgin_reachables, 255, MAP_RBB_SIZE(afl->fsrv.num_reachables));
+  memset(afl->virgin_freachables, 255, MAP_RF_SIZE(afl->fsrv.num_freachables));
+
+  aflrun_init_globals(afl,
+    afl->fsrv.num_targets, afl->fsrv.num_reachables,
+    afl->fsrv.num_ftargets, afl->fsrv.num_freachables, afl->virgin_reachables,
+    afl->virgin_freachables, afl->virgin_ctx, afl->reachable_names,
+    afl->reachable_to_targets, afl->reachable_to_size, afl->out_dir,
+    afl->target_weights, afl->fsrv.map_size, afl->shm_run.div_switch,
+    getenv("AFLRUN_CYCLE_TIME"));
 
   if (likely(!afl->afl_env.afl_no_startup_calibration)) {
 
@@ -2282,7 +2351,8 @@ int main(int argc, char **argv_orig, char **envp) {
   #ifdef INTROSPECTION
   u32 prev_saved_crashes = 0, prev_saved_tmouts = 0;
   #endif
-  u32 prev_queued_items = 0, runs_in_current_cycle = (u32)-1;
+  afl->runs_in_current_cycle = (u32)-1;
+  u32 prev_queued_items = 0;
   u8  skipped_fuzz;
 
   #ifdef INTROSPECTION
@@ -2298,13 +2368,43 @@ int main(int argc, char **argv_orig, char **envp) {
   OKF("Writing mutation introspection to '%s'", ifn);
   #endif
 
+  /* AFLRun fuzzing loop:
+  while (!stop)
+    cycle_end() // end of each cycle, its first call is a pseudo cycle end
+    if (aflrun)
+      energy = assign_energy_each_seed()
+    else
+      // AFL++ cycle begin process
+    for (seed in corpus)
+      fuzz_one(seed, energy[seed])
+      update_prev()
+      if (resetted) // begin next cycle directly if mode is resetted
+        break
+  */
+
   while (likely(!afl->stop_soon)) {
 
     cull_queue(afl);
+    afl->is_aflrun = aflrun_get_mode();
+    u8 is_cycle_end = afl->old_seed_selection || afl->is_aflrun ?
+      !afl->queue_cur :
+      afl->runs_in_current_cycle > (afl->queued_items - afl->queued_extra);
 
-    if (unlikely((!afl->old_seed_selection &&
-                  runs_in_current_cycle > afl->queued_items) ||
-                 (afl->old_seed_selection && !afl->queue_cur))) {
+    if (unlikely(is_cycle_end || afl->force_cycle_end)) {
+
+      afl->force_cycle_end = 0;
+      u8 whole_end;
+      afl->is_aflrun = aflrun_cycle_end(&whole_end);
+      // afl->is_aflrun may be updated because cycle end may change the mode
+
+      /* Now it's the beginning of a new cycle */
+
+      // We need to re-calculate perf_score at beginning of each coverage cycle.
+      // Also we need to cull queue before each coverage cycle.
+      if (!afl->is_aflrun) {
+        afl->reinit_table = 1;
+        afl->score_changed = 1;
+      }
 
       if (unlikely((afl->last_sync_cycle < afl->queue_cycle ||
                     (!afl->queue_cycle && afl->afl_env.afl_import_first)) &&
@@ -2317,11 +2417,16 @@ int main(int argc, char **argv_orig, char **envp) {
         }
 
         sync_fuzzers(afl);
+        // If sync causes some reset, we need to re-start the cycle
+        if (aflrun_end_cycle()) {
+          afl->force_cycle_end = 1;
+          continue;
+        }
 
       }
 
       ++afl->queue_cycle;
-      runs_in_current_cycle = (u32)-1;
+      afl->runs_in_current_cycle = (u32)-1;
       afl->cur_skipped_items = 0;
 
       // 1st april fool joke - enable pizza mode
@@ -2343,7 +2448,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
       }
 
-      if (unlikely(afl->old_seed_selection)) {
+      if (unlikely(afl->old_seed_selection && !afl->is_aflrun)) {
 
         afl->current_entry = 0;
         while (unlikely(afl->current_entry < afl->queued_items &&
@@ -2372,6 +2477,50 @@ int main(int argc, char **argv_orig, char **envp) {
 
         }
 
+      } else if (likely(afl->is_aflrun)) {
+
+        // In aflrun mode, at beginning of each cycle,
+        // we need to allocate engergy and sort for each seed
+
+        u32 n = select_aflrun_seeds(afl);
+        afl->aflrun_favored = n;
+        u32* seeds = afl->aflrun_seeds;
+
+        afl->perf_scores = afl_realloc(
+          (void**)&afl->perf_scores, n * sizeof(double));
+        aflrun_assign_energy(n, seeds, afl->perf_scores);
+
+        afl->aflrun_queue = afl_realloc(
+          (void**)&afl->aflrun_queue, (n+1) * sizeof(struct queue_entry *));
+
+        u32 idx = 0;
+        for (u32 i = 0; i < n; i++) {
+
+          struct queue_entry *q = afl->queue_buf[seeds[i]];
+
+          if (q->id != seeds[i])
+            FATAL("ID does not match");
+
+          q->quant_score = afl->perf_scores[i];
+          if (q->quant_score > afl->queue_quant_thr)
+            afl->aflrun_queue[idx++] = q;
+
+        }
+        afl->aflrun_queue[idx] = NULL; // set last to NULL to detect end of cycle
+        afl->queued_aflrun = idx;
+
+        qsort(afl->aflrun_queue, idx, sizeof(struct queue_entry*), cmp_quant_score);
+
+        afl->queue_cur = afl->aflrun_queue[(afl->aflrun_idx = 0)];
+        if (afl->queue_cur == NULL)
+          continue; // if no seed, we skip the cycle
+        afl->current_entry = afl->queue_cur->id;
+
+        if (afl->log_at_begin)
+          aflrun_write_to_log(afl);
+        if (afl->check_at_begin)
+          aflrun_check_state();
+        aflrun_set_num_active_seeds(idx);
       }
 
       if (unlikely(afl->not_on_tty)) {
@@ -2380,6 +2529,10 @@ int main(int argc, char **argv_orig, char **envp) {
         fflush(stdout);
 
       }
+
+      if (unlikely(whole_end || afl->queue_cycle == 1)) {
+      // Only do these AFL cycle end stuff at whole_end or at very beginning.
+      // In other words, we regard aflrun whole cycle as original AFL++ cycle.
 
       /* If we had a full queue cycle with no new finds, try
          recombination strategies next. */
@@ -2465,7 +2618,7 @@ int main(int argc, char **argv_orig, char **envp) {
               afl->queued_items);
   #endif
 
-      if (afl->cycle_schedules) {
+      if (afl->cycle_schedules && !afl->is_aflrun) {
 
         /* we cannot mix non-AFLfast schedules with others */
 
@@ -2516,13 +2669,15 @@ int main(int argc, char **argv_orig, char **envp) {
 
       prev_queued = afl->queued_items;
 
+      }
+
     }
 
-    ++runs_in_current_cycle;
+    ++afl->runs_in_current_cycle;
 
     do {
 
-      if (likely(!afl->old_seed_selection)) {
+      if (unlikely(!afl->old_seed_selection && !afl->is_aflrun)) {
 
         if (unlikely(prev_queued_items < afl->queued_items ||
                      afl->reinit_table)) {
@@ -2543,6 +2698,8 @@ int main(int argc, char **argv_orig, char **envp) {
 
       }
 
+      // count num of `common_fuzz_stuff` called in `fuzz_one`
+      afl->fuzzed_times = 0;
       skipped_fuzz = fuzz_one(afl);
   #ifdef INTROSPECTION
       ++afl->queue_cur->stats_selected;
@@ -2578,9 +2735,17 @@ int main(int argc, char **argv_orig, char **envp) {
 
   #endif
 
+      // Commit the fuzzed quantum,
+      // we need floating point here to prevent always adding zero
+      double fuzzed_quantum =
+        afl->fuzzed_times * afl->queue_cur->exec_us / (double)QUANTUM_TIME;
+      aflrun_update_fuzzed_quant(afl->queue_cur->id, fuzzed_quantum);
+      afl->quantum_ratio = afl->is_aflrun ?
+        fuzzed_quantum / afl->queue_cur->quant_score : -1;
+
       if (unlikely(!afl->stop_soon && exit_1)) { afl->stop_soon = 2; }
 
-      if (unlikely(afl->old_seed_selection)) {
+      if (unlikely(afl->old_seed_selection && !afl->is_aflrun)) {
 
         while (++afl->current_entry < afl->queued_items &&
                afl->queue_buf[afl->current_entry]->disabled) {};
@@ -2596,9 +2761,17 @@ int main(int argc, char **argv_orig, char **envp) {
 
         }
 
+      } else if (afl->is_aflrun) {
+
+        afl->queue_cur = afl->aflrun_queue[++afl->aflrun_idx];
+        afl->current_entry = afl->queue_cur == NULL ?
+          afl->queued_items : afl->queue_cur->id;
+        // TODO: skip disabled seeds just like above
+
       }
 
-    } while (skipped_fuzz && afl->queue_cur && !afl->stop_soon);
+    } while (skipped_fuzz && afl->queue_cur && !afl->stop_soon
+        && !afl->force_cycle_end);
 
     if (likely(!afl->stop_soon && afl->sync_id)) {
 
@@ -2632,6 +2805,8 @@ int main(int argc, char **argv_orig, char **envp) {
         sync_fuzzers(afl);
 
       }
+
+      if (aflrun_end_cycle()) { afl->force_cycle_end = 1; }
 
     }
 
@@ -2700,7 +2875,35 @@ stop_fuzzing:
             "Profiling information: %llu ms total work, %llu ns/run\n",
        time_spent_working / 1000000,
        time_spent_working / afl->fsrv.total_execs);
+
+  u8* profile_file = alloc_printf("%s/profiling.txt", afl->out_dir);
+  fd = fopen(profile_file, "w");
+  ck_free(profile_file);
+  if (fd == NULL)
+    FATAL("Cannot open profiling file");
+  fprintf(fd, "%llu %llu %lu "
+  #ifdef AFLRUN_OVERHEAD
+        "%0.02f%% "
+  #endif // AFLRUN_OVERHEAD
+        "%0.02f%%\n",
+        time_spent_working, afl->fsrv.total_execs, aflrun_get_num_clusters(),
+  #ifdef AFLRUN_OVERHEAD
+      (double)afl->fsrv.trace_virgin->overhead * 100 /
+      (afl->exec_time + afl->fuzz_time),
+  #endif // AFLRUN_OVERHEAD
+      (double)afl->exec_time * 100 /
+        (afl->exec_time + afl->fuzz_time));
+  fclose(fd);
   #endif
+
+  u8* times_file = alloc_printf("%s/fuzzed_times.txt", afl->out_dir);
+  fd = fopen(times_file, "w");
+  ck_free(times_file);
+  if (fd == NULL)
+    FATAL("Cannot open file to record number of fuzzed times for each seed");
+  for (u32 i = 0; i < afl->queued_items; i++)
+    fprintf(fd, "%llu\n", afl->queue_buf[i]->fuzzed_times);
+  fclose(fd);
 
   if (afl->is_main_node) {
 

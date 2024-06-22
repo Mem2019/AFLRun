@@ -29,6 +29,7 @@
 #define __AFL_SHAREDMEM_H
 
 #include "types.h"
+#include "trace.h"
 
 typedef struct sharedmem {
 
@@ -56,8 +57,32 @@ typedef struct sharedmem {
 
 } sharedmem_t;
 
+#ifdef USEMMAP
+#error "AFLRun Does not support USEMMAP currently"
+#endif
+
+typedef struct aflrun_shm {
+
+  /* aflrun id */
+  s32 shm_rbb_id, shm_rf_id, shm_tr_id,
+    shm_vir_id, shm_vtr_id, shm_tt_id, shm_div_id;
+
+  u8 *map_reachables;          /* SHM to trace reachable BBs */
+  u8 *map_freachables;         /* SHM to trace reachable Functions */
+  u8 *map_ctx;                 /* SHM to trace reachables with context */
+  trace_t *map_new_blocks;         /* For each newly reached virgin block,
+  we record call context and path context, this is useful for fringe testing */
+  u8 *map_virgin_ctx;                /* Virgin bits for context-sensitive */
+  trace_t *map_targets;        /* For each reached targets, we record relative
+  information, this is useful for target diversity */
+  u8 *div_switch; /* A switch to tell program if we should record diversity */
+
+} aflrun_shm_t;
+
 u8  *afl_shm_init(sharedmem_t *, size_t, unsigned char non_instrumented_mode);
 void afl_shm_deinit(sharedmem_t *);
+void aflrun_shm_init(aflrun_shm_t*, reach_t, reach_t, unsigned char);
+void aflrun_shm_deinit(aflrun_shm_t*);
 
 #endif
 

@@ -24,6 +24,7 @@
  */
 
 #include "afl-fuzz.h"
+#include "aflrun.h"
 #include <limits.h>
 #if !defined NAME_MAX
   #define NAME_MAX _XOPEN_NAME_MAX
@@ -237,6 +238,35 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
 }
 
+inline u8 has_new_bits_mul(afl_state_t *afl,
+  u8* const *virgin_maps, u8** p_new_bits, size_t num, u8 modify) {
+
+  u8* new_bits = *p_new_bits = afl_realloc((void **)p_new_bits, sizeof(u8) * num);
+  memset(new_bits, 0, sizeof(u8) * num);
+
+  // TODO: 32-bit
+  u64 *current = (u64 *)afl->fsrv.trace_bits;
+  u64* const *virgins = (u64* const *)virgin_maps;
+
+  u32 len = ((afl->fsrv.real_map_size + 7) >> 3);
+
+  for (u32 i = 0; i < len; ++i, ++current) {
+
+    if (unlikely(*current))
+      discover_word_mul(new_bits, current, virgins, num, i, modify);
+
+  }
+
+  u8 primary = new_bits[0], diversity = 0;
+  for (size_t i = 1; i < num; ++i) // Get max level of new edge from all div maps
+    diversity = MAX(diversity, new_bits[i]);
+
+  // lowest 2 bits are result from primary map,
+  // and 2-3 bits are from diversity maps
+  return primary | (diversity << 2);
+
+}
+
 /* A combination of classify_counts and has_new_bits. If 0 is returned, then the
  * trace bits are kept as-is. Otherwise, the trace bits are overwritten with
  * classified values.
@@ -247,25 +277,29 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
  * on rare cases it fall backs to the slow path: classify_counts() first, then
  * return has_new_bits(). */
 
-inline u8 has_new_bits_unclassified(afl_state_t *afl, u8 *virgin_map) {
+static u8 has_new_bits_unclassified(
+  afl_state_t *afl, u8 *const * virgin_maps, size_t num) {
 
   /* Handle the hot path first: no new coverage */
   u8 *end = afl->fsrv.trace_bits + afl->fsrv.map_size;
 
 #ifdef WORD_SIZE_64
 
-  if (!skim((u64 *)virgin_map, (u64 *)afl->fsrv.trace_bits, (u64 *)end))
+  if (!skim((const u64* const*)virgin_maps, num,
+    (u64 *)afl->fsrv.trace_bits, (u64 *)end))
     return 0;
 
 #else
 
+  #error "TODO: 32-bit"
   if (!skim((u32 *)virgin_map, (u32 *)afl->fsrv.trace_bits, (u32 *)end))
     return 0;
 
 #endif                                                     /* ^WORD_SIZE_64 */
-  classify_counts(&afl->fsrv);
-  return has_new_bits(afl, virgin_map);
 
+  // We don't classify here and call `has_new_bits_mul` here,
+  // we because some virgin maps may be missed due to incomplete fringe
+  return 1;
 }
 
 /* Compact trace bytes into a smaller bitmap. We effectively just drop the
@@ -290,7 +324,8 @@ void minimize_bits(afl_state_t *afl, u8 *dst, u8 *src) {
 /* Construct a file name for a new test case, capturing the operation
    that led to its discovery. Returns a ptr to afl->describe_op_buf_256. */
 
-u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
+u8 *describe_op(afl_state_t *afl,
+  u8 new_bits, u8 new_paths, size_t max_description_len) {
 
   u8 is_timeout = 0;
 
@@ -300,6 +335,9 @@ u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
     is_timeout = 1;
 
   }
+
+  u8 new_div = new_bits >> 2;
+  new_bits &= 3;
 
   size_t real_max_len =
       MIN(max_description_len, sizeof(afl->describe_op_buf_256));
@@ -333,7 +371,8 @@ u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
       ret[len_current++] = ',';
       ret[len_current] = '\0';
 
-      ssize_t size_left = real_max_len - len_current - strlen(",+cov") - 2;
+      ssize_t size_left = real_max_len - len_current -
+        strlen(",+cov2") - strlen(",+div2") - strlen(",+path") - 2;
       if (is_timeout) { size_left -= strlen(",+tout"); }
       if (unlikely(size_left <= 0)) FATAL("filename got too long");
 
@@ -382,7 +421,15 @@ u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
 
   if (is_timeout) { strcat(ret, ",+tout"); }
 
-  if (new_bits == 2) { strcat(ret, ",+cov"); }
+  if (new_bits) {
+    strcat(ret, ",+cov");
+    if (new_bits == 2) { strcat(ret, "2"); }
+  }
+  if (new_div) {
+    strcat(ret, ",+div");
+    if (new_div == 2) { strcat(ret, "2"); }
+  }
+  if (new_paths) { strcat(ret, ",+path"); }
 
   if (unlikely(strlen(ret) >= max_description_len))
     FATAL("describe string is too long");
@@ -453,13 +500,17 @@ void write_crash_readme(afl_state_t *afl) {
    entry is saved, 0 otherwise. */
 
 u8 __attribute__((hot))
-save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
+save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault, u8 inc) {
 
-  if (unlikely(len == 0)) { return 0; }
+  if (unlikely(len == 0)) {
+    aflrun_recover_virgin(afl);
+    return 0;
+  }
 
   u8  fn[PATH_MAX];
   u8 *queue_fn = "";
-  u8  new_bits = 0, keeping = 0, res, classified = 0, is_timeout = 0;
+  u8  new_bits = 0, new_paths = 0,
+    keeping = 0, res, classified = 0, is_timeout = 0;
   s32 fd;
   u64 cksum = 0;
 
@@ -467,7 +518,8 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
   /* Generating a hash on every input is super expensive. Bad idea and should
      only be used for special schedules */
-  if (unlikely(afl->schedule >= FAST && afl->schedule <= RARE)) {
+  if (unlikely(!afl->is_aflrun &&
+    afl->schedule >= FAST && afl->schedule <= RARE)) {
 
     cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
 
@@ -482,16 +534,63 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
 
-    new_bits = has_new_bits_unclassified(afl, afl->virgin_bits);
+    size_t n = afl->fsrv.trace_targets->num;
+    afl->virgins = afl_realloc((void **)&afl->virgins, sizeof(u8*) * (n+1));
+    afl->clusters = afl_realloc((void **)&afl->clusters, sizeof(size_t) * (n+1));
+    afl->virgins[0] = afl->virgin_bits;
+    afl->clusters[0] = 0; // primary map is always cluster 0
+    afl->num_maps = aflrun_get_virgins(afl->fsrv.trace_targets->trace, n,
+      afl->virgins + 1, afl->clusters + 1) + 1;
+    new_bits = has_new_bits_unclassified(afl, afl->virgins, afl->num_maps);
+    if (new_bits) {
+      classify_counts(&afl->fsrv);
+      classified = 1;
+      has_new_bits_mul(afl, afl->virgins, &afl->new_bits, afl->num_maps, 0);
+    }
+    new_paths = aflrun_has_new_path(afl->fsrv.trace_freachables,
+      afl->fsrv.trace_reachables, afl->fsrv.trace_ctx,
+      afl->fsrv.trace_virgin->trace, afl->fsrv.trace_virgin->num,
+      inc, afl->queued_items,
+      new_bits ? afl->new_bits : NULL, afl->clusters, afl->num_maps);
 
-    if (likely(!new_bits)) {
+    if (likely(!new_bits && !new_paths)) {
 
       if (unlikely(afl->crash_mode)) { ++afl->total_crashes; }
       return 0;
 
     }
 
-    classified = new_bits;
+    /*/ DEBUG
+    printf("Targets(Interesting): ");
+    for (size_t i = 0; i < n; ++i) {
+      printf("%u ", afl->fsrv.trace_targets->trace[i].block);
+    }
+    printf("\n");
+    printf("Clusters(Interesting): ");
+    for (size_t i = 0; i < afl->num_maps; ++i) {
+      printf("%u ", afl->clusters[i]);
+    }
+    printf("\n");
+    // DEBUG*/
+
+    // We clasify and update bits after related fringes is updated,
+    // but before that we may need to update `virgin_maps`
+    // because there might be new fringes.
+
+    n = aflrun_max_clusters(afl->queued_items);
+    afl->virgins = afl_realloc((void **)&afl->virgins, sizeof(u8*) * n);
+    afl->clusters = afl_realloc((void **)&afl->clusters, sizeof(size_t) * n);
+    afl->virgins[0] = afl->virgin_bits;
+    afl->clusters[0] = 0;
+    afl->num_maps = aflrun_get_seed_virgins(
+      afl->queued_items, afl->virgins + 1, afl->clusters + 1) + 1;
+
+    if (!classified) {
+      classify_counts(&afl->fsrv);
+      classified = 1;
+    }
+    new_bits = has_new_bits_mul(
+      afl, afl->virgins, &afl->new_bits, afl->num_maps, 1);
 
   save_to_queue:
 
@@ -499,7 +598,7 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
     queue_fn =
         alloc_printf("%s/queue/id:%06u,%s", afl->out_dir, afl->queued_items,
-                     describe_op(afl, new_bits + is_timeout,
+                     describe_op(afl, new_bits + is_timeout, new_paths,
                                  NAME_MAX - strlen("id:000000,")));
 
 #else
@@ -513,6 +612,15 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
     ck_write(fd, mem, len, queue_fn);
     close(fd);
     add_to_queue(afl, queue_fn, len, 0);
+    afl->queue_top->tested = 1;
+    afl->queue_top->path_cksum = hash64(
+      afl->fsrv.trace_ctx, MAP_TR_SIZE(afl->fsrv.num_reachables), HASH_CONST);
+
+    // If the new seed only comes from diversity or path, mark it as extra
+    if ((new_bits & 3) == 0 && ((new_bits >> 2) || new_paths)) {
+      ++afl->queued_extra;
+      afl->queue_top->aflrun_extra = 1;
+    }
 
 #ifdef INTROSPECTION
     if (afl->custom_mutators_count && afl->current_custom_fuzz) {
@@ -543,7 +651,7 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
 #endif
 
-    if (new_bits == 2) {
+    if ((new_bits & 3) == 2) {
 
       afl->queue_top->has_new_cov = 1;
       ++afl->queued_with_cov;
@@ -565,7 +673,7 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
     /* Try to calibrate inline; this also calls update_bitmap_score() when
        successful. */
 
-    res = calibrate_case(afl, afl->queue_top, mem, afl->queue_cycle - 1, 0);
+    res = calibrate_case(afl, afl->queue_top, mem, aflrun_queue_cycle(), 0);
 
     if (unlikely(res == FSRV_RUN_ERROR)) {
 
@@ -581,6 +689,9 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
     keeping = 1;
 
+  }
+  else {
+    aflrun_recover_virgin(afl);
   }
 
   switch (fault) {
@@ -678,6 +789,13 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
           if (afl->afl_env.afl_keep_timeouts) {
 
             ++afl->saved_tmouts;
+            // For saved timeout case, we don't update it with aflrun,
+            // so we don't call it with `aflrun_has_new_path`, e.i. `tested = 1`.
+            // Also, we need to set virgin map array to have only primary map.
+            afl->virgins = afl_realloc((void **)&afl->virgins, sizeof(u8*));
+            afl->virgins[0] = afl->virgin_bits;
+            afl->clusters[0] = 0;
+            afl->num_maps = 1;
             goto save_to_queue;
 
           } else {
@@ -694,7 +812,7 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
       snprintf(fn, PATH_MAX, "%s/hangs/id:%06llu,%s", afl->out_dir,
                afl->saved_hangs,
-               describe_op(afl, 0, NAME_MAX - strlen("id:000000,")));
+               describe_op(afl, 0, 0, NAME_MAX - strlen("id:000000,")));
 
 #else
 
@@ -742,7 +860,7 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
       snprintf(fn, PATH_MAX, "%s/crashes/id:%06llu,sig:%02u,%s", afl->out_dir,
                afl->saved_crashes, afl->fsrv.last_kill_signal,
-               describe_op(afl, 0, NAME_MAX - strlen("id:000000,sig:00,")));
+               describe_op(afl, 0, 0, NAME_MAX - strlen("id:000000,sig:00,")));
 
 #else
 

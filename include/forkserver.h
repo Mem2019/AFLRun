@@ -32,6 +32,7 @@
 #include <stdbool.h>
 
 #include "types.h"
+#include "trace.h"
 
 #ifdef __linux__
 /**
@@ -82,6 +83,12 @@ typedef struct afl_forkserver {
   /* a program that includes afl-forkserver needs to define these */
 
   u8 *trace_bits;                       /* SHM with instrumentation bitmap  */
+  u8* trace_reachables;                 /* SHM to trace reachable BBs       */
+  u8* trace_freachables;                /* SHM to trace reachable Functions */
+  u8* trace_ctx;                    /* SHM to trace reachables with context */
+  trace_t* trace_virgin;               /* For each newly reached virgin block,
+ we record call context and path context, this is useful for fringe testing */
+  trace_t* trace_targets;              /* Reached targets in each run       */
 
   s32 fsrv_pid,                         /* PID of the fork server           */
       child_pid,                        /* PID of the fuzzed program        */
@@ -179,6 +186,15 @@ typedef struct afl_forkserver {
   u32                   nyx_bind_cpu_id; /* nyx runner cpu id                */
   char                 *nyx_aux_string;
 #endif
+
+  reach_t num_targets,           /* Number of target basic blocks */
+           num_reachables;            /* Number of basic blocks reachable
+                                          to any target*/
+  reach_t num_ftargets,          /* Number of target functions */
+           num_freachables;           /* Number of functions reachable
+                                          to any function target */
+
+  u8 testing;
 
 } afl_forkserver_t;
 

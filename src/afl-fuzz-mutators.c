@@ -25,6 +25,7 @@
  */
 
 #include "afl-fuzz.h"
+#include "aflrun.h"
 
 struct custom_mutator *load_custom_mutator(afl_state_t *, const char *);
 #ifdef USE_PYTHON
@@ -209,7 +210,7 @@ struct custom_mutator *load_custom_mutator(afl_state_t *afl, const char *fn) {
     mutator->afl_custom_fuzz = dlsym(dh, "afl_custom_mutator");
     if (!mutator->afl_custom_fuzz) {
 
-      WARNF("Symbol 'afl_custom_mutator' not found.");
+      FATAL("Neither symbol 'afl_custom_mutator' nor 'afl_custom_fuzz' found.");
 
     } else {
 
@@ -452,7 +453,7 @@ u8 trim_case_custom(afl_state_t *afl, struct queue_entry *q, u8 *in_buf,
     sprintf(afl->stage_name_buf, "ptrim %s",
             u_stringify_int(val_buf, trim_exec));
 
-    u64 cksum;
+    u64 cksum, pcksum;
 
     size_t retlen = mutator->afl_custom_trim(mutator->data, &retbuf);
 
@@ -507,12 +508,14 @@ u8 trim_case_custom(afl_state_t *afl, struct queue_entry *q, u8 *in_buf,
 
         classify_counts(&afl->fsrv);
         cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+        pcksum = hash64(
+          afl->fsrv.trace_ctx, MAP_TR_SIZE(afl->fsrv.num_reachables), HASH_CONST);
 
       }
 
     }
 
-    if (likely(retlen && cksum == q->exec_cksum)) {
+    if (likely(retlen && cksum == q->exec_cksum && pcksum == q->path_cksum)) {
 
       /* Let's save a clean trace, which will be needed by
          update_bitmap_score once we're done with the trimming stuff.
@@ -598,6 +601,7 @@ u8 trim_case_custom(afl_state_t *afl, struct queue_entry *q, u8 *in_buf,
 
     memcpy(afl->fsrv.trace_bits, afl->clean_trace_custom, afl->fsrv.map_size);
     update_bitmap_score(afl, q);
+    aflrun_update_fringe_score(q->id);
 
   }
 

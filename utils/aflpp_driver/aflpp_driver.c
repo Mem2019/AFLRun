@@ -52,11 +52,6 @@ $AFL_HOME/afl-fuzz -i IN -o OUT ./a.out
 
 #include "config.h"
 #include "types.h"
-#include "cmplog.h"
-
-#ifdef _DEBUG
-  #include "hash.h"
-#endif
 
 int                   __afl_sharedmem_fuzzing = 1;
 extern unsigned int  *__afl_fuzz_len;

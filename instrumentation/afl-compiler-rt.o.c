@@ -19,6 +19,7 @@
 #endif
 #include "config.h"
 #include "types.h"
+#include "trace.h"
 #include "cmplog.h"
 #include "llvm-alternative-coverage.h"
 
@@ -27,6 +28,7 @@
 #undef XXH_INLINE_ALL
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
@@ -36,8 +38,10 @@
 #include <stddef.h>
 #include <limits.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 #include <sys/mman.h>
+#include <sys/time.h>
 #ifndef __HAIKU__
   #include <sys/syscall.h>
 #endif
@@ -99,6 +103,29 @@ static u32 __afl_fuzz_len_dummy;
 u32       *__afl_fuzz_len = &__afl_fuzz_len_dummy;
 int        __afl_sharedmem_fuzzing __attribute__((weak));
 
+atomic_uchar* __afl_rbb_ptr = NULL;
+atomic_uchar* __afl_rbb_ptr_bak = NULL;
+atomic_uchar* __afl_rbb_ptr_shm = NULL;
+atomic_uchar* __afl_rf_ptr = NULL;
+atomic_uchar* __afl_rf_ptr_bak = NULL;
+atomic_uchar* __afl_rf_ptr_shm = NULL;
+atomic_uchar* __afl_tr_ptr = NULL;
+atomic_uchar* __afl_tr_ptr_bak = NULL;
+atomic_uchar* __afl_tr_ptr_shm = NULL;
+atomic_uchar* __afl_vir_ptr = NULL;
+atomic_uchar* __afl_vir_ptr_bak = NULL;
+atomic_uchar* __afl_vir_ptr_shm = NULL;
+trace_t* __afl_vtr_ptr = NULL;
+trace_t* __afl_vtr_ptr_bak = NULL;
+trace_t* __afl_vtr_ptr_shm = NULL;
+trace_t* __afl_tt_ptr = NULL;
+trace_t* __afl_tt_ptr_bak = NULL;
+trace_t* __afl_tt_ptr_shm = NULL;
+atomic_uchar* __afl_div_ptr = NULL;
+atomic_uchar* __afl_div_ptr_bak = NULL;
+atomic_uchar* __afl_div_ptr_shm = NULL;
+bool inited = false;
+
 u32 __afl_final_loc;
 u32 __afl_map_size = MAP_SIZE;
 u32 __afl_dictionary_len;
@@ -122,6 +149,10 @@ __thread PREV_LOC_T __afl_prev_loc[NGRAM_SIZE_MAX];
 __thread PREV_LOC_T __afl_prev_caller[CTX_MAX_K];
 __thread u32        __afl_prev_ctx;
 #endif
+__thread u32 __afl_call_ctx = 0;
+
+static reach_t num_targets, num_reachables, num_freachables;
+extern reach_t __aflrun_num_targets, __aflrun_num_reachables, __aflrun_num_freachables;
 
 struct cmp_map *__afl_cmp_map;
 struct cmp_map *__afl_cmp_map_backup;
@@ -276,7 +307,32 @@ static void __afl_map_shm_fuzz() {
 
 }
 
+static inline void* my_mmap(size_t size) {
+  if (size == 0) return NULL;
+  const size_t kPageSize = sysconf(_SC_PAGESIZE);
+  size = ((size + kPageSize - 1) / kPageSize) * kPageSize;
+  return mmap(NULL, size,
+    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+}
+
+static inline void switch_to_shm(void) {
+
+  __afl_rbb_ptr = __afl_rbb_ptr_shm;
+  __afl_rf_ptr = __afl_rf_ptr_shm;
+  __afl_tr_ptr = __afl_tr_ptr_shm;
+  __afl_vir_ptr = __afl_vir_ptr_shm;
+  __afl_vtr_ptr = __afl_vtr_ptr_shm;
+  __afl_tt_ptr = __afl_tt_ptr_shm;
+  __afl_div_ptr = __afl_div_ptr_shm;
+
+  if (!IS_SET(__afl_rbb_ptr, num_reachables)) {
+    __afl_vir_ptr = __afl_vir_ptr_bak;
+  }
+}
+
 /* SHM setup. */
+
+
 
 static void __afl_map_shm(void) {
 
@@ -287,6 +343,37 @@ static void __afl_map_shm(void) {
   if (!__afl_area_ptr) { __afl_area_ptr = __afl_area_ptr_dummy; }
 
   char *id_str = getenv(SHM_ENV_VAR);
+  char *rbb_id_str = getenv(SHM_RBB_ENV_VAR);
+  char *rf_id_str = getenv(SHM_RF_ENV_VAR);
+  char *tr_id_str = getenv(SHM_TR_ENV_VAR);
+  char *vir_id_str = getenv(SHM_VIR_ENV_VAR);
+  char *vtr_id_str = getenv(SHM_VTR_ENV_VAR);
+  char *tt_id_str = getenv(SHM_TT_ENV_VAR);
+  char *div_id_str = getenv(SHM_DIV_ENV_VAR);
+
+#define SHMAT_AFLRUN(name) \
+  if (name##_id_str) { \
+    u32 shm_##name##_id = atoi(name##_id_str); \
+    __afl_##name##_ptr_shm = shmat(shm_##name##_id, NULL, 0); \
+    if (__afl_##name##_ptr_shm == (void *)-1) { \
+      send_forkserver_error(FS_ERROR_SHMAT); \
+      perror("shmat for aflrun map"); \
+      _exit(1); \
+    } \
+  } \
+  else { \
+    __afl_##name##_ptr_shm = __afl_##name##_ptr_bak; \
+  }
+
+  SHMAT_AFLRUN(rbb)
+  SHMAT_AFLRUN(rf)
+  SHMAT_AFLRUN(tr)
+  SHMAT_AFLRUN(vir)
+  SHMAT_AFLRUN(vtr)
+  SHMAT_AFLRUN(tt)
+  SHMAT_AFLRUN(div)
+
+#undef SHMAT_AFLRUN
 
   if (__afl_final_loc) {
 
@@ -1052,7 +1139,10 @@ static void __afl_start_forkserver(void) {
   /* Phone home and tell the parent that we're OK. If parent isn't there,
      assume we're not running in forkserver mode and just execute program. */
 
-  if (write(FORKSRV_FD + 1, tmp, 4) != 4) { return; }
+  if (write(FORKSRV_FD + 1, tmp, 4) != 4) {
+    switch_to_shm();
+    return;
+  }
 
   __afl_connected = 1;
 
@@ -1202,6 +1292,11 @@ static void __afl_start_forkserver(void) {
 
         close(FORKSRV_FD);
         close(FORKSRV_FD + 1);
+
+        // if not persistent mode, we need to switch to shared memory
+        if (!is_persistent) {
+          switch_to_shm();
+        }
         return;
 
       }
@@ -1269,6 +1364,7 @@ int __afl_persistent_loop(unsigned int max_cnt) {
     memset(__afl_area_ptr, 0, __afl_map_size);
     __afl_area_ptr[0] = 1;
     memset(__afl_prev_loc, 0, NGRAM_SIZE_MAX * sizeof(PREV_LOC_T));
+    switch_to_shm();
 
     cycle_cnt = max_cnt;
     first_pass = 0;
@@ -1284,6 +1380,7 @@ int __afl_persistent_loop(unsigned int max_cnt) {
     memset(__afl_prev_loc, 0, NGRAM_SIZE_MAX * sizeof(PREV_LOC_T));
     __afl_selective_coverage_temp = 1;
 
+    switch_to_shm();
     return 1;
 
   } else {
@@ -1293,6 +1390,13 @@ int __afl_persistent_loop(unsigned int max_cnt) {
         dummy output region. */
 
     __afl_area_ptr = __afl_area_ptr_dummy;
+    __afl_rbb_ptr = __afl_rbb_ptr_bak;
+    __afl_rf_ptr = __afl_rf_ptr_bak;
+    __afl_tr_ptr = __afl_tr_ptr_bak;
+    __afl_vir_ptr = __afl_vir_ptr_bak;
+    __afl_vtr_ptr = __afl_vtr_ptr_bak;
+    __afl_tt_ptr = __afl_tt_ptr_bak;
+    __afl_div_ptr = __afl_div_ptr_bak;
 
     return 0;
 
@@ -1374,6 +1478,29 @@ __attribute__((constructor(EARLY_FS_PRIO))) void __early_forkserver(void) {
 __attribute__((constructor(CTOR_PRIO))) void __afl_auto_early(void) {
 
   is_persistent = !!getenv(PERSIST_ENV_VAR);
+
+  // if there is no aflrun instrumentation, we can just set them to 1 if NULL
+  num_targets = __aflrun_num_targets;
+  num_reachables = __aflrun_num_reachables;
+  num_freachables = __aflrun_num_freachables;
+
+  __afl_rbb_ptr_bak = my_mmap(MAP_RBB_SIZE(num_reachables));
+  __afl_rf_ptr_bak = my_mmap(MAP_RF_SIZE(num_freachables));
+  __afl_tr_ptr_bak = my_mmap(MAP_TR_SIZE(num_reachables));
+  __afl_vir_ptr_bak = my_mmap(MAP_TR_SIZE(num_reachables));
+  __afl_vtr_ptr_bak = my_mmap(MAP_VTR_SIZE(num_reachables));
+  __afl_tt_ptr_bak = my_mmap(MAP_VTR_SIZE(num_reachables));
+  __afl_div_ptr_bak = my_mmap(MAP_RBB_SIZE(num_reachables));
+
+  __afl_rbb_ptr = __afl_rbb_ptr_bak;
+  __afl_rf_ptr = __afl_rf_ptr_bak;
+  __afl_tr_ptr = __afl_tr_ptr_bak;
+  __afl_vir_ptr = __afl_vir_ptr_bak;
+  __afl_vtr_ptr = __afl_vtr_ptr_bak;
+  __afl_tt_ptr = __afl_tt_ptr_bak;
+  __afl_div_ptr = __afl_div_ptr_bak;
+
+  inited = true;
 
   if (getenv("AFL_DISABLE_LLVM_INSTRUMENTATION")) return;
 
@@ -2404,3 +2531,91 @@ void __afl_set_persistent_mode(u8 mode) {
 
 #undef write_error
 
+/* For block that can reach at least one target, we instrument following
+if (block not executed)
+  mark the block as executed
+  increment frequency of the block
+*/
+
+#ifdef AFLRUN_OVERHEAD
+
+u64 aflrun_cur_time(void) {
+
+  struct timeval  tv;
+  struct timezone tz;
+
+  gettimeofday(&tv, &tz);
+
+  return tv.tv_sec * 1000ULL * 1000ULL + tv.tv_usec;
+
+}
+
+#endif // AFLRUN_OVERHEAD
+
+#ifdef __x86_64__
+bool aflrun_inst(u64 block) __attribute__((visibility("default")));
+bool aflrun_inst(u64 block)
+#else
+bool aflrun_inst(u32 block) __attribute__((visibility("default")));
+bool aflrun_inst(u32 block)
+#endif
+{
+  // Handle some functions called before backup memory is initialized
+  if (unlikely(!inited)) return false;
+
+#ifdef AFLRUN_OVERHEAD
+  u64 t0 = aflrun_cur_time();
+#endif // AFLRUN_OVERHEAD
+
+  u32 ctx = __afl_call_ctx;
+  size_t off = CTX_NUM_BYTES * block + ctx / 8;
+  u8 bit = 1 << (ctx % 8);
+
+#ifdef AFLRUN_CTX_DIV
+  #error "TODO: Currently not supported due to introduction of fringe diversity"
+  atomic_fetch_or(__afl_rbb_ptr + block / 8, 1 << (block % 8));
+  u8 val = atomic_fetch_or(__afl_tr_ptr + off, bit);
+
+  // For the first time a context-sensitive target is reached, append it
+  if (block < num_targets && (val & bit) == 0) {
+    ctx_t* e = __afl_tt_ptr->trace + atomic_fetch_add(&__afl_tt_ptr->num, 1);
+    e->block = block;
+    e->call_ctx = ctx;
+  }
+#else
+  u8 bit2 = 1 << (block % 8);
+  u8 val = atomic_fetch_or(__afl_rbb_ptr + block / 8, bit2);
+  atomic_fetch_or(__afl_tr_ptr + off, bit);
+
+  // For the first time a diversity block is reached, append it
+  bool ret = IS_SET(__afl_div_ptr, block);
+  if (ret && (val & bit2) == 0) {
+    ctx_t* e = __afl_tt_ptr->trace + atomic_fetch_add(&__afl_tt_ptr->num, 1);
+    e->block = block;
+  }
+#endif
+
+  val = atomic_fetch_and(__afl_vir_ptr + off, ~bit);
+  if (val & bit) {
+    ctx_t* e = __afl_vtr_ptr->trace + atomic_fetch_add(&__afl_vtr_ptr->num, 1);
+    e->block = block;
+    e->call_ctx = ctx;
+  }
+
+#ifdef AFLRUN_OVERHEAD
+  atomic_fetch_add(&__afl_tt_ptr->overhead, aflrun_cur_time() - t0);
+#endif // AFLRUN_OVERHEAD
+  return ret; // Return true for laf
+}
+
+#ifdef __x86_64__
+void aflrun_f_inst(u64 func) __attribute__((visibility("default")));
+void aflrun_f_inst(u64 func)
+#else
+void aflrun_f_inst(u32 func) __attribute__((visibility("default")));
+void aflrun_f_inst(u32 func)
+#endif
+{
+  if (unlikely(!inited)) return;
+  atomic_fetch_or(__afl_rf_ptr + func / 8, 1 << (func % 8));
+}

@@ -1,5 +1,6 @@
 #include "config.h"
 #include "types.h"
+#error "AFLRun does not support 32 bit fuzzing, please use 64 version"
 
 u32 skim(const u32 *virgin, const u32 *current, const u32 *current_end);
 u32 classify_word(u32 word);

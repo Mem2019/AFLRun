@@ -365,3 +365,92 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
 
 }
 
+void aflrun_shm_init(aflrun_shm_t *shm, reach_t num_reachables,
+  reach_t num_freachables, unsigned char non_instrumented_mode) {
+
+  u8 *shm_rbb_str, *shm_rf_str, *shm_tr_str,
+    *shm_vir_str, *shm_vtr_str, *shm_tt_str, *shm_div_str;
+
+  shm->shm_rbb_id = shmget(IPC_PRIVATE, MAP_RBB_SIZE(num_reachables),
+    IPC_CREAT | IPC_EXCL | DEFAULT_PERMISSION);
+  shm->shm_rf_id = shmget(IPC_PRIVATE, MAP_RF_SIZE(num_freachables),
+    IPC_CREAT | IPC_EXCL | DEFAULT_PERMISSION);
+  shm->shm_tr_id = shmget(IPC_PRIVATE, MAP_TR_SIZE(num_reachables),
+      IPC_CREAT | IPC_EXCL | DEFAULT_PERMISSION);
+  shm->shm_vir_id = shmget(IPC_PRIVATE, MAP_TR_SIZE(num_reachables),
+      IPC_CREAT | IPC_EXCL | DEFAULT_PERMISSION);
+  shm->shm_vtr_id = shmget(IPC_PRIVATE, MAP_VTR_SIZE(num_reachables),
+      IPC_CREAT | IPC_EXCL | DEFAULT_PERMISSION);
+  shm->shm_tt_id = shmget(IPC_PRIVATE, MAP_VTR_SIZE(num_reachables),
+      IPC_CREAT | IPC_EXCL | DEFAULT_PERMISSION);
+  shm->shm_div_id = shmget(IPC_PRIVATE, MAP_RBB_SIZE(num_reachables),
+    IPC_CREAT | IPC_EXCL | DEFAULT_PERMISSION);
+
+  if (shm->shm_rbb_id < 0 || shm->shm_rf_id < 0 || shm->shm_tr_id < 0 ||
+    shm->shm_vir_id < 0 || shm->shm_vtr_id < 0 || shm->shm_tt_id < 0 ||
+    shm->shm_div_id < 0)
+    PFATAL("shmget() failed");
+
+  if (!non_instrumented_mode) {
+
+    shm_rbb_str = alloc_printf("%d", shm->shm_rbb_id);
+    shm_rf_str = alloc_printf("%d", shm->shm_rf_id);
+    shm_tr_str = alloc_printf("%d", shm->shm_tr_id);
+    shm_vir_str = alloc_printf("%d", shm->shm_vir_id);
+    shm_vtr_str = alloc_printf("%d", shm->shm_vtr_id);
+    shm_tt_str = alloc_printf("%d", shm->shm_tt_id);
+    shm_div_str = alloc_printf("%d", shm->shm_div_id);
+
+    setenv(SHM_RBB_ENV_VAR, shm_rbb_str, 1);
+    setenv(SHM_RF_ENV_VAR, shm_rf_str, 1);
+    setenv(SHM_TR_ENV_VAR, shm_tr_str, 1);
+    setenv(SHM_VIR_ENV_VAR, shm_vir_str, 1);
+    setenv(SHM_VTR_ENV_VAR, shm_vtr_str, 1);
+    setenv(SHM_TT_ENV_VAR, shm_tt_str, 1);
+    setenv(SHM_DIV_ENV_VAR, shm_div_str, 1);
+
+    ck_free(shm_rbb_str);
+    ck_free(shm_rf_str);
+    ck_free(shm_tr_str);
+    ck_free(shm_vir_str);
+    ck_free(shm_vtr_str);
+    ck_free(shm_tt_str);
+    ck_free(shm_div_str);
+
+  }
+
+  shm->map_reachables = shmat(shm->shm_rbb_id, NULL, 0);
+  shm->map_freachables = shmat(shm->shm_rf_id, NULL, 0);
+  shm->map_ctx = shmat(shm->shm_tr_id, NULL, 0);
+  shm->map_virgin_ctx = shmat(shm->shm_vir_id, NULL, 0);
+  shm->map_new_blocks = shmat(shm->shm_vtr_id, NULL, 0);
+  shm->map_targets = shmat(shm->shm_tt_id, NULL, 0);
+  shm->div_switch = shmat(shm->shm_div_id, NULL, 0);
+
+#define ERROR_SHM(addr) ((addr) == ((void *)-1) || !(addr))
+  if (ERROR_SHM(shm->map_reachables) || ERROR_SHM(shm->map_freachables) ||
+      ERROR_SHM(shm->map_ctx) || ERROR_SHM(shm->map_virgin_ctx) ||
+      ERROR_SHM(shm->map_new_blocks) || ERROR_SHM(shm->map_targets) ||
+      ERROR_SHM(shm->div_switch)) {
+
+    aflrun_shm_deinit(shm);
+    PFATAL("shmat() failed");
+
+  }
+#undef ERROR_SHM
+
+  memset(shm->map_virgin_ctx, 255, MAP_TR_SIZE(num_reachables));
+
+}
+
+void aflrun_shm_deinit(aflrun_shm_t *shm) {
+
+  shmctl(shm->shm_rbb_id, IPC_RMID, NULL);
+  shmctl(shm->shm_rf_id, IPC_RMID, NULL);
+  shmctl(shm->shm_tr_id, IPC_RMID, NULL);
+  shmctl(shm->shm_vir_id, IPC_RMID, NULL);
+  shmctl(shm->shm_vtr_id, IPC_RMID, NULL);
+  shmctl(shm->shm_tt_id, IPC_RMID, NULL);
+  shmctl(shm->shm_div_id, IPC_RMID, NULL);
+
+}

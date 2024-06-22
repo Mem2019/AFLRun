@@ -23,8 +23,14 @@
 #ifndef _HAVE_TYPES_H
 #define _HAVE_TYPES_H
 
+#ifdef __cplusplus
+#include <cstdint>
+#include <cstdlib>
+#else
 #include <stdint.h>
 #include <stdlib.h>
+#endif
+
 #include "config.h"
 
 typedef uint8_t  u8;
@@ -191,6 +197,15 @@ typedef int128_t s128;
     #define unlikely(_x) __builtin_expect(!!(_x), 0)
   #endif
 #endif
+
+typedef u32 reach_t;
+
+typedef struct {
+  reach_t block;
+  u32 call_ctx;
+} ctx_t;
+
+#define IS_SET(arr, i) (((arr)[(i) / 8] & (1 << ((i) % 8))) != 0)
 
 #endif                                                   /* ! _HAVE_TYPES_H */
 

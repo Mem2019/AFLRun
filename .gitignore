@@ -62,6 +62,7 @@ afl-lto
 afl-lto++
 afl-lto++.8
 afl-lto.8
+aflrun-cc
 qemu_mode/libcompcov/compcovtest
 qemu_mode/qemu-*
 qemu_mode/qemuafl
@@ -98,3 +99,11 @@ utils/persistent_mode/test-instr
 !coresight_mode
 !coresight_mode/coresight-trace
 vuln_prog
+aflrun-test/
+*.sublime-*
+.gdb_history
+codeql-pack.lock.yml
+.cache/
+*.tex
+*.bib
+ignore

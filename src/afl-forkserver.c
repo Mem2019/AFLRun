@@ -1395,6 +1395,26 @@ afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
 
 }
 
+/* Reset shared memory before each run */
+void afl_fsrv_clear(afl_forkserver_t *fsrv) {
+  memset(fsrv->trace_bits, 0, fsrv->map_size);
+
+  if (fsrv->num_reachables != 0) {
+
+    memset(fsrv->trace_reachables, 0, MAP_RBB_SIZE(fsrv->num_reachables));
+    memset(fsrv->trace_freachables, 0, MAP_RF_SIZE(fsrv->num_freachables));
+    memset(fsrv->trace_ctx, 0, MAP_TR_SIZE(fsrv->num_reachables));
+    fsrv->trace_virgin->num = 0;
+    fsrv->trace_targets->num = 0;
+
+    // If we want to count frequency, set last bit of block bitmap
+    if (fsrv->testing)
+      fsrv->trace_reachables[fsrv->num_reachables / 8] |=
+        1 << (fsrv->num_reachables % 8);
+
+  }
+}
+
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update afl->fsrv->trace_bits. */
 
@@ -1470,14 +1490,12 @@ afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
 
 #ifdef __linux__
   if (!fsrv->nyx_mode) {
-
-    memset(fsrv->trace_bits, 0, fsrv->map_size);
+    afl_fsrv_clear(fsrv);
     MEM_BARRIER();
-
   }
 
 #else
-  memset(fsrv->trace_bits, 0, fsrv->map_size);
+  afl_fsrv_clear(fsrv);
   MEM_BARRIER();
 #endif
 

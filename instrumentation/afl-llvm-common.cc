@@ -288,14 +288,18 @@ void scanForDangerousFunctions(llvm::Module *M) {
 
     StringRef ifunc_name = IF.getName();
     Constant *r = IF.getResolver();
-    StringRef r_name = cast<Function>(r->getOperand(0))->getName();
+    std::string r_name;
+    if (r->getNumOperands() > 0)
+      r_name = cast<Function>(r->getOperand(0))->getName().str();
+    else
+      r_name = "fucking_crash";
     if (!be_quiet)
       fprintf(stderr,
               "Note: Found an ifunc with name %s that points to resolver "
               "function %s, we will not instrument this, putting it into the "
               "block list.\n",
-              ifunc_name.str().c_str(), r_name.str().c_str());
-    denyListFunctions.push_back(r_name.str());
+              ifunc_name.str().c_str(), r_name.c_str());
+    denyListFunctions.push_back(r_name);
 
   }
 

@@ -508,5 +508,44 @@
 
 #define AFL_TXT_STRING_MAX_MUTATIONS 6
 
+/* Shared memory used to record if each basic block and function
+   reachable to any target has been executed during one execution */
+#define SHM_RBB_ENV_VAR    "__AFLRUN_RBB_SHM_ID"
+#define SHM_RF_ENV_VAR     "__AFLRUN_RF_SHM_ID"
+
+#define SHM_TR_ENV_VAR     "__AFLRUN_TR_SHM_ID"
+#define SHM_VIR_ENV_VAR    "__AFLRUN_VIR_SHM_ID"
+#define SHM_VTR_ENV_VAR    "__AFLRUN_VTR_SHM_ID"
+
+#define SHM_TT_ENV_VAR     "__AFLRUN_TT_SHM_ID"
+#define SHM_DIV_ENV_VAR    "__AFLRUN_DIV_SHM_ID"
+
+#define CTX_SIZE_POW2       8
+#define CTX_SIZE            (1 << CTX_SIZE_POW2)
+#define CTX_NUM_BYTES       (CTX_SIZE / 8)
+#define CTX_IDX(block, ctx) ((block) * CTX_SIZE + (ctx))
+
+#define MAP_RF_SIZE(nr)     (((nr) + 7) / 8)
+#define MAP_RBB_SIZE(nr)    MAP_RF_SIZE((nr) + 1)
+// we need one more bit for telling if counting frequency
+#define MAP_TR_SIZE(nr)     ((nr) * CTX_NUM_BYTES)
+#ifndef AFLRUN_CTX
+#define MAP_VTR_SIZE(nr)    ((nr) * sizeof(ctx_t) + sizeof(trace_t))
+#else
+#define MAP_VTR_SIZE(nr)    (MAP_TR_SIZE(nr) * 8 * sizeof(ctx_t) + sizeof(trace_t))
+#endif // AFLRUN_CTX
+
+#define AFLRUN_SPLICE_TIMES(e, sc) \
+   (((e) * SPLICE_HAVOC) / (HAVOC_CYCLES + SPLICE_HAVOC * (sc)))
+#define AFLRUN_HAVOC_TIMES(e, sc) \
+   ((e) - AFLRUN_SPLICE_TIMES(e, (sc)) * (sc))
+#define AFLRUN_CUSTOM_TIMES(e, n) \
+   (((e) * HAVOC_CYCLES) / \
+   (HAVOC_CYCLES + SPLICE_HAVOC * SPLICE_CYCLES + HAVOC_CYCLES * (n)))
+
+#define QUANTUM_TIME 100000
+
+#define AFLRUN_TEMP_SIG "##SIG_AFLRUN_TEMP_DIR##="
+
 #endif                                                  /* ! _HAVE_CONFIG_H */
 

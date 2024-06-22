@@ -72,6 +72,11 @@ static u8 outfile[PATH_MAX];
 static u8 *in_data,                    /* Input data                        */
     *coverage_map;                     /* Coverage map                      */
 
+static u8 **target_coverage_maps;      /* Coverage map for each target      */
+static u32* target_coverage_cnts; /* Number of covered edges of each target.
+target_coverage_cnts[t] should be number of ones of target_coverage_maps[t].*/
+static u32* target_cnts;          /* Number of seeds that cover each target */
+
 static u64 total;                      /* tuple content information         */
 static u32 tcnt, highest;              /* tuple content information         */
 
@@ -91,12 +96,15 @@ static bool quiet_mode,                /* Hide non-essential messages?      */
     no_classify,                       /* do not classify counts            */
     debug,                             /* debug mode                        */
     print_filenames,                   /* print the current filename        */
-    wait_for_gdb;
+    wait_for_gdb, aflrun_d;
+
+FILE* aflrun_log, *aflrun_cnt, *aflrun_tcov;
 
 static volatile u8 stop_soon,          /* Ctrl-C pressed?                   */
     child_crashed;                     /* Child crashed?                    */
 
 static sharedmem_t       shm;
+static aflrun_shm_t      shm_run;
 static afl_forkserver_t *fsrv;
 static sharedmem_t      *shm_fuzz;
 
@@ -187,6 +195,7 @@ static void at_exit_handler(void) {
 
     if (shm.map) afl_shm_deinit(&shm);
     if (fsrv->use_shmem_fuzz) deinit_shmem(fsrv, shm_fuzz);
+    if (aflrun_d) aflrun_shm_deinit(&shm_run);
 
   }
 
@@ -211,6 +220,60 @@ static void analyze_results(afl_forkserver_t *fsrv) {
 
   }
 
+}
+
+static void aflrun_analyze_results(afl_forkserver_t *fsrv, u8* fn) {
+
+  const ctx_t* beg = fsrv->trace_targets->trace;
+  const ctx_t* end = beg + fsrv->trace_targets->num;
+  u8* visited = calloc(fsrv->num_targets, sizeof(u8));
+
+  // Iterate each target it covers
+  for (const ctx_t* it = beg; it < end; it++) {
+
+    reach_t t = it->block;
+
+    if (visited[t]) continue;
+    visited[t] = 1;
+
+    u8* map = target_coverage_maps[t];
+
+    // Iterate each map corresponding to each covered target
+    for (u32 i = 0; i < map_size; i++) {
+
+      if (fsrv->trace_bits[i] && !map[i]) {
+
+        map[i] = 1;
+        target_coverage_cnts[t]++;
+
+      }
+
+    }
+
+    // If a target is covered by this seed, increment its count.
+    target_cnts[t]++;
+
+  }
+
+  // If called from executing one input, we don't log
+  if (fn == NULL)
+    return;
+  // Record current state about number of edges for each target
+
+  fprintf(aflrun_tcov, "%s\n", fn);
+  for (reach_t t = 0; t < fsrv->num_targets; t++)
+    fprintf(aflrun_tcov, "%u ", visited[t]);
+  fprintf(aflrun_tcov, "\n");
+
+  free(visited);
+
+  fprintf(aflrun_log, "%s\n", fn);
+  for (reach_t t = 0; t < fsrv->num_targets; t++) {
+    fprintf(aflrun_log, "%u", target_coverage_cnts[t]);
+    if (t != fsrv->num_targets - 1)
+      fprintf(aflrun_log, ",");
+  }
+  fprintf(aflrun_log, "\n");
 }
 
 /* Write results. */
@@ -743,6 +806,9 @@ u32 execute_testcases(u8 *dir) {
        a dot */
     if (subdirs && S_ISDIR(st.st_mode) && nl[i]->d_name[0] != '.') {
 
+      if (aflrun_d)
+        FATAL("Use -d flag only for queue/ directory");
+
       free(nl[i]);                                           /* not tracked */
       done += execute_testcases(fn2);
       ck_free(fn2);
@@ -757,6 +823,10 @@ u32 execute_testcases(u8 *dir) {
       continue;
 
     }
+
+    // Only process file begin with "id:" in aflrun mode
+    if (aflrun_d && strncmp(nl[i]->d_name, "id:", 3))
+      continue;
 
     if (st.st_size > MAX_FILE && !be_quiet && !quiet_mode) {
 
@@ -791,6 +861,9 @@ u32 execute_testcases(u8 *dir) {
         analyze_results(fsrv);
       else
         tcnt = write_results_to_file(fsrv, outfile);
+
+      if (aflrun_d)
+        aflrun_analyze_results(fsrv, fn2);
 
     }
 
@@ -849,7 +922,8 @@ static void usage(u8 *argv0) {
       "  -e         - show edge coverage only, ignore hit counts\n"
       "  -r         - show real tuple values instead of AFL filter values\n"
       "  -s         - do not classify the map\n"
-      "  -c         - allow core dumps\n\n"
+      "  -c         - allow core dumps\n"
+      "  -d         - get target coverage, may need AFL_DRIVER_DONT_DEFER=1\n\n"
 
       "This tool displays raw tuple data captured by AFL instrumentation.\n"
       "For additional help, consult %s/README.md.\n\n"
@@ -886,6 +960,30 @@ static void usage(u8 *argv0) {
 
 }
 
+static void load_aflrun_header(
+  u8* file, reach_t* num_targets, reach_t* num_reachables) {
+  FILE* fd = fopen(file, "r");
+  if (fd == NULL)
+    FATAL("Failed to open %s", file);
+  char* line = NULL; size_t len = 0;
+  ssize_t res = getline(&line, &len, fd);
+  if (res == -1 || line == NULL)
+    FATAL("Failed to read %s", file);
+
+  char* endptr;
+  *num_targets = strtoul(line, &endptr, 10);
+  if (*endptr != ',')
+    FATAL("Wrong format for %s", file);
+  *endptr = 0;
+  *num_reachables = strtoul(endptr + 1, &endptr, 10);
+  if (*endptr != 0 && *endptr != '\n')
+    FATAL("Wrong format for %s", file);
+  if (*num_targets == 0 || *num_targets > *num_reachables)
+    FATAL("Wrong number of targets and reachables");
+  ck_free(file);
+  free(line);
+}
+
 /* Main entry point */
 
 int main(int argc, char **argv_orig, char **envp) {
@@ -896,6 +994,7 @@ int main(int argc, char **argv_orig, char **envp) {
   bool mem_limit_given = false, timeout_given = false, unicorn_mode = false,
        use_wine = false;
   char **use_argv;
+  const char* prefix = NULL;
 
   char **argv = argv_cpy_dup(argc, argv_orig);
 
@@ -912,7 +1011,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   if (getenv("AFL_QUIET") != NULL) { be_quiet = true; }
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:AeqCZOH:QUWbcrsh")) > 0) {
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:AeqCZOH:QUWbcrshd:p:")) > 0) {
 
     switch (opt) {
 
@@ -1126,6 +1225,42 @@ int main(int argc, char **argv_orig, char **envp) {
         return -1;
         break;
 
+      case 'd':
+        aflrun_d = true;
+        load_aflrun_header(alloc_printf("%s/BBreachable.txt", optarg),
+          &fsrv->num_targets, &fsrv->num_reachables);
+        load_aflrun_header(alloc_printf("%s/Freachable.txt", optarg),
+          &fsrv->num_ftargets, &fsrv->num_freachables);
+        u8* log_file; u8* cnt_file; u8* tcov_file;
+        if (prefix) {
+          log_file = alloc_printf("%s/%s.log.txt", optarg, prefix);
+          cnt_file = alloc_printf("%s/%s.cnt.txt", optarg, prefix);
+          tcov_file = alloc_printf("%s/%s.tcov.txt", optarg, prefix);
+        } else {
+          log_file = alloc_printf("%s/log.txt", optarg);
+          cnt_file = alloc_printf("%s/cnt.txt", optarg);
+          tcov_file = alloc_printf("%s/tcov.txt", optarg);
+        }
+        aflrun_log = fopen(log_file, "w");
+        if (aflrun_log == NULL)
+          FATAL("Open log.txt failed");
+        aflrun_cnt = fopen(cnt_file, "w");
+        if (aflrun_cnt == NULL)
+          FATAL("Open cnt.txt failed");
+        aflrun_tcov = fopen(tcov_file, "w");
+        if (aflrun_tcov == NULL)
+          FATAL("Open tcov.txt failed");
+        ck_free(tcov_file);
+        ck_free(log_file);
+        ck_free(cnt_file);
+        break;
+
+      case 'p':
+        if (aflrun_log)
+          FATAL("Please put -p before -d");
+        prefix = strdup(optarg);
+        break;
+
       default:
         usage(argv[0]);
 
@@ -1173,6 +1308,16 @@ int main(int argc, char **argv_orig, char **envp) {
 
   fsrv->target_path = find_binary(argv[optind]);
   fsrv->trace_bits = afl_shm_init(&shm, map_size, 0);
+  if (aflrun_d) {
+    aflrun_shm_init(&shm_run, fsrv->num_reachables, fsrv->num_freachables, 0);
+    fsrv->trace_reachables = shm_run.map_reachables;
+    fsrv->trace_freachables = shm_run.map_freachables;
+    fsrv->trace_ctx = shm_run.map_ctx;
+    fsrv->trace_virgin = shm_run.map_new_blocks;
+    fsrv->trace_targets = shm_run.map_targets;
+    for (reach_t t = 0; t < fsrv->num_targets; ++t)
+      shm_run.div_switch[t / 8] |= 1 << (t % 8);
+  }
 
   if (!quiet_mode) {
 
@@ -1332,6 +1477,21 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  if (aflrun_d) {
+    // Initialize coverage map for each target
+    target_coverage_maps = (u8**)malloc(fsrv->num_targets * sizeof(u8*));
+    if (target_coverage_maps == NULL)
+      FATAL("coult not grab memory");
+    for (reach_t i = 0; i < fsrv->num_targets; ++i) {
+      target_coverage_maps[i] = malloc(map_size + 64);
+      if (target_coverage_maps[i] == NULL)
+        FATAL("coult not grab memory");
+      memset(target_coverage_maps[i], 0, map_size + 64);
+    }
+    target_coverage_cnts = calloc(fsrv->num_targets, sizeof(u32));
+    target_cnts = calloc(fsrv->num_targets, sizeof(u32));
+  }
+
   if (in_dir) {
 
     DIR *dir_in, *dir_out = NULL;
@@ -1411,6 +1571,11 @@ int main(int argc, char **argv_orig, char **envp) {
 
     }
 
+    for (reach_t t = 0; t < fsrv->num_targets; ++t) {
+      fprintf(aflrun_cnt, "%u ", target_cnts[t]);
+    }
+    fprintf(aflrun_cnt, "\n");
+
     if (!quiet_mode) { OKF("Processed %llu input files.", fsrv->total_execs); }
 
     if (dir_out) { closedir(dir_out); }
@@ -1429,6 +1594,15 @@ int main(int argc, char **argv_orig, char **envp) {
 
     showmap_run_target(fsrv, use_argv);
     tcnt = write_results_to_file(fsrv, out_file);
+    if (aflrun_d) {
+
+      aflrun_analyze_results(fsrv, NULL);
+      for (reach_t t = 0; t < fsrv->num_targets; ++t) {
+        fprintf(aflrun_cnt, "%u ", target_cnts[t]);
+      }
+      fprintf(aflrun_cnt, "\n");
+
+    }
     if (!quiet_mode) {
 
       OKF("Hash of coverage map: %llx",
@@ -1485,6 +1659,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   argv_cpy_free(argv);
   if (fsrv->qemu_mode) { free(use_argv[2]); }
+  if (aflrun_d) { fclose(aflrun_log); fclose(aflrun_cnt); fclose(aflrun_tcov); }
 
   exit(ret);
 

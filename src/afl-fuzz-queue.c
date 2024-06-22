@@ -23,6 +23,7 @@
  */
 
 #include "afl-fuzz.h"
+#include "aflrun.h"
 #include <limits.h>
 #include <ctype.h>
 #include <math.h>
@@ -102,7 +103,7 @@ void create_alias_table(afl_state_t *afl) {
       struct queue_entry *q = afl->queue_buf[i];
 
       // disabled entries might have timings and bitmap values
-      if (likely(!q->disabled)) {
+      if (likely(!q->disabled && (!q->aflrun_extra || q->favored))) {
 
         avg_exec_us += q->exec_us;
         avg_bitmap_size += log(q->bitmap_size);
@@ -121,7 +122,7 @@ void create_alias_table(afl_state_t *afl) {
 
       struct queue_entry *q = afl->queue_buf[i];
 
-      if (likely(!q->disabled)) {
+      if (likely(!q->disabled && (!q->aflrun_extra || q->favored))) {
 
         q->weight =
             compute_weight(afl, q, avg_exec_us, avg_bitmap_size, avg_top_size);
@@ -145,7 +146,8 @@ void create_alias_table(afl_state_t *afl) {
 
       struct queue_entry *q = afl->queue_buf[i];
 
-      if (likely(!q->disabled)) { q->perf_score = calculate_score(afl, q); }
+      if (likely(!q->disabled && (!q->aflrun_extra || q->favored)))
+        { q->perf_score = calculate_score(afl, q); }
 
       sum += q->perf_score;
 
@@ -597,6 +599,53 @@ void destroy_queue(afl_state_t *afl) {
 
 }
 
+u64 get_seed_fav_factor(void* afl, u32 seed) {
+
+  struct queue_entry *q = ((afl_state_t*)afl)->queue_buf[seed];
+
+  if (q->id != seed)
+    FATAL("ID Error");
+
+  return q->exec_us * q->len;
+}
+
+double get_seed_perf_score(void* afl, u32 seed) {
+
+  struct queue_entry *q = ((afl_state_t*)afl)->queue_buf[seed];
+
+  if (q->id != seed)
+    FATAL("ID Error");
+
+  return q->perf_score;
+}
+
+bool get_seed_div_favored(void* afl, u32 seed) {
+
+  struct queue_entry *q = ((afl_state_t*)afl)->queue_buf[seed];
+
+  if (q->id != seed)
+    FATAL("ID Error");
+
+  return q->div_favored;
+
+}
+
+u8 get_seed_cov_favored(void* afl, u32 seed) {
+
+  struct queue_entry *q = ((afl_state_t*)afl)->queue_buf[seed];
+
+  if (q->id != seed)
+    FATAL("ID Error");
+
+  if (q->favored)
+    return 2; // 2 for favored seed
+  if (q->aflrun_extra)
+    return 0; // 0 for extra seed
+  else
+    return 1; // 1 for non-favored seed
+
+}
+
 /* When we bump into a new path, we call this to see if the path appears
    more "favorable" than any of the existing ones. The purpose of the
    "favorables" is to have a minimal set of paths that trigger all the bits
@@ -608,7 +657,8 @@ void destroy_queue(afl_state_t *afl) {
    previous contender, or if the contender has a more favorable speed x size
    factor. */
 
-void update_bitmap_score(afl_state_t *afl, struct queue_entry *q) {
+static void update_bitmap_score_original(u8 primary,
+  afl_state_t *afl, struct queue_entry *q, struct queue_entry **top_rated) {
 
   u32 i;
   u64 fav_factor;
@@ -637,25 +687,25 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q) {
 
     if (afl->fsrv.trace_bits[i]) {
 
-      if (afl->top_rated[i]) {
+      if (top_rated[i]) {
 
         /* Faster-executing or smaller test cases are favored. */
         u64 top_rated_fav_factor;
         u64 top_rated_fuzz_p2;
         if (unlikely(afl->schedule >= FAST && afl->schedule <= RARE))
           top_rated_fuzz_p2 =
-              next_pow2(afl->n_fuzz[afl->top_rated[i]->n_fuzz_entry]);
+              next_pow2(afl->n_fuzz[top_rated[i]->n_fuzz_entry]);
         else
-          top_rated_fuzz_p2 = afl->top_rated[i]->fuzz_level;
+          top_rated_fuzz_p2 = top_rated[i]->fuzz_level;
 
         if (unlikely(afl->schedule >= RARE) || unlikely(afl->fixed_seed)) {
 
-          top_rated_fav_factor = afl->top_rated[i]->len << 2;
+          top_rated_fav_factor = top_rated[i]->len << 2;
 
         } else {
 
           top_rated_fav_factor =
-              afl->top_rated[i]->exec_us * afl->top_rated[i]->len;
+              top_rated[i]->exec_us * top_rated[i]->len;
 
         }
 
@@ -671,12 +721,12 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q) {
 
         if (unlikely(afl->schedule >= RARE) || unlikely(afl->fixed_seed)) {
 
-          if (fav_factor > afl->top_rated[i]->len << 2) { continue; }
+          if (fav_factor > top_rated[i]->len << 2) { continue; }
 
         } else {
 
           if (fav_factor >
-              afl->top_rated[i]->exec_us * afl->top_rated[i]->len) {
+              top_rated[i]->exec_us * top_rated[i]->len) {
 
             continue;
 
@@ -687,10 +737,10 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q) {
         /* Looks like we're going to win. Decrease ref count for the
            previous winner, discard its afl->fsrv.trace_bits[] if necessary. */
 
-        if (!--afl->top_rated[i]->tc_ref) {
+        if (!--top_rated[i]->tc_ref) {
 
-          ck_free(afl->top_rated[i]->trace_mini);
-          afl->top_rated[i]->trace_mini = 0;
+          ck_free(top_rated[i]->trace_mini);
+          top_rated[i]->trace_mini = 0;
 
         }
 
@@ -698,7 +748,7 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q) {
 
       /* Insert ourselves as the new winner. */
 
-      afl->top_rated[i] = q;
+      top_rated[i] = q;
       ++q->tc_ref;
 
       if (!q->trace_mini) {
@@ -709,11 +759,26 @@ void update_bitmap_score(afl_state_t *afl, struct queue_entry *q) {
 
       }
 
-      afl->score_changed = 1;
+      if (primary)
+        afl->score_changed = 1;
+      else
+        afl->div_score_changed = 1;
 
     }
 
   }
+
+}
+
+void update_bitmap_score(afl_state_t *afl, struct queue_entry *q) {
+
+  size_t n = aflrun_max_clusters(q->id);
+  afl->tops = afl_realloc((void **)&afl->tops, sizeof(struct queue_entry**) * n);
+  afl->tops[0] = afl->top_rated;
+  size_t num_tops = aflrun_get_seed_tops(q->id, (void***)(afl->tops + 1)) + 1;
+
+  for (size_t i = 0; i < num_tops; ++i)
+    update_bitmap_score_original(i == 0, afl, q, afl->tops[i]);
 
 }
 
@@ -783,6 +848,61 @@ void cull_queue(afl_state_t *afl) {
     if (likely(!afl->queue_buf[i]->disabled)) {
 
       mark_as_redundant(afl, afl->queue_buf[i], !afl->queue_buf[i]->favored);
+
+    }
+
+  }
+
+}
+
+static void clear_div_favored(afl_state_t *afl) {
+
+  for (u32 i = 0; i < afl->queued_items; i++) {
+
+    afl->queue_buf[i]->div_favored = 0;
+
+  }
+
+}
+
+static void cull_queue_div(afl_state_t *afl, u8 mode) {
+
+  if (likely(!afl->div_score_changed || afl->non_instrumented_mode)) { return; }
+
+  u32 len = (afl->fsrv.map_size >> 3);
+  u8 *temp_v = afl->map_tmp_buf;
+
+  afl->div_score_changed = 0;
+
+  clear_div_favored(afl);
+
+  size_t n = aflrun_get_num_clusters();
+  afl->tops = afl_realloc((void**)&afl->tops, sizeof(struct queue_entry**) * n);
+  n = aflrun_get_all_tops((void***)afl->tops, mode);
+
+  for (size_t k = 0; k < n; ++k) {
+
+    struct queue_entry** top_rated = afl->tops[k];
+    memset(temp_v, 255, len);
+
+    for (u32 i = 0; i < afl->fsrv.map_size; ++i) {
+
+      if (top_rated[i] && (temp_v[i >> 3] & (1 << (i & 7)))) {
+
+        u32 j = len;
+        while (j--) {
+
+          if (top_rated[i]->trace_mini[j]) {
+
+            temp_v[j] &= ~top_rated[i]->trace_mini[j];
+
+          }
+
+        }
+
+        top_rated[i]->div_favored = 1;
+
+      }
 
     }
 
@@ -883,15 +1003,20 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
      in the game we learned about this path. Latecomers are allowed to run
      for a bit longer until they catch up with the rest. */
 
-  if (q->handicap >= 4) {
+  // We only want to change `handicap` in coverage mode
+  if (!afl->is_aflrun) {
 
-    perf_score *= 4;
-    q->handicap -= 4;
+    if (q->handicap >= 4) {
 
-  } else if (q->handicap) {
+      perf_score *= 4;
+      q->handicap -= 4;
 
-    perf_score *= 2;
-    --q->handicap;
+    } else if (q->handicap) {
+
+      perf_score *= 2;
+      --q->handicap;
+
+    }
 
   }
 
@@ -1359,3 +1484,86 @@ inline void queue_testcase_store_mem(afl_state_t *afl, struct queue_entry *q,
 
 }
 
+/* select seeds for aflrun to fuzz in this cycle */
+
+u32 select_aflrun_seeds(afl_state_t *afl) {
+
+  afl->aflrun_seeds = afl_realloc(
+    (void**)&afl->aflrun_seeds, afl->queued_items * sizeof(u32));
+
+  u32 idx = 0;
+  for (u32 i = 0; i < afl->queued_items; i++) {
+
+    struct queue_entry *q = afl->queue_buf[i];
+
+    if (!q->disabled) {
+      afl->aflrun_seeds[idx++] = q->id;
+
+      // This is needed for energy allocation among identical seeds
+      q->perf_score = calculate_score(afl, q);
+    }
+
+    q->quant_score = 0;
+
+  }
+
+  if (aflrun_is_uni()) {
+
+    // For unite mode, we select favored seeds for each of 3 modes
+    for (u8 mode = 1; mode <= 3; ++mode) {
+      cull_queue_div(afl, mode);
+      aflrun_set_favored_seeds(afl->aflrun_seeds, idx, mode);
+    }
+
+  } else {
+
+    cull_queue_div(afl, aflrun_get_mode());
+
+  }
+
+  return aflrun_cull_queue(afl->aflrun_seeds, idx);
+
+}
+
+int cmp_quant_score(const void* a, const void* b) {
+
+  const struct queue_entry* entry_a = *(const struct queue_entry* const*)a;
+  const struct queue_entry* entry_b = *(const struct queue_entry* const*)b;
+
+  // We want to sort in descending order
+  if (entry_b->quant_score > entry_a->quant_score)
+    return 1;
+  else if (entry_b->quant_score == entry_a->quant_score)
+    return 0;
+  else
+    return -1;
+
+}
+
+void disable_aflrun_extra(void* afl_void, u32 seed) {
+
+  afl_state_t* afl = (afl_state_t *)afl_void;
+  struct queue_entry* s = afl->queue_buf[seed];
+
+  if (s->aflrun_extra) {
+
+    if (s->disabled)
+      FATAL("Disabling same seed twice");
+
+    // If this is not correctly decremented, coverage fuzzer cannot work well.
+    if (!s->was_fuzzed) {
+
+      --afl->pending_not_fuzzed;
+      if (s->favored) { --afl->pending_favored; }
+
+    }
+
+    if (s->favored) { --afl->queued_favored; }
+
+    s->favored = false;
+    s->disabled = true;
+    ++afl->queued_extra_disabled;
+
+  }
+
+}

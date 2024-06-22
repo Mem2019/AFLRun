@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <list>
+#include <unordered_set>
 #include <string>
 #include <fstream>
 #include <sys/time.h>
@@ -56,6 +57,7 @@
 #endif
 
 using namespace llvm;
+#define IS_EXTERN extern
 #include "afl-llvm-common.h"
 
 // uncomment this toggle function verification at each step. horribly slow, but
@@ -64,36 +66,24 @@ using namespace llvm;
 
 namespace {
 
-#if LLVM_MAJOR >= 11
-class SplitComparesTransform : public PassInfoMixin<SplitComparesTransform> {
+class SplitComparesTransform {
 
  public:
-  //  static char ID;
-  SplitComparesTransform() : enableFPSplit(0) {
-
-#else
-class SplitComparesTransform : public ModulePass {
-
- public:
-  static char ID;
-  SplitComparesTransform() : ModulePass(ID), enableFPSplit(0) {
-
-#endif
+  explicit SplitComparesTransform(
+    const std::unordered_set<BasicBlock*>& target_bb) :
+    target_bb(target_bb), enableFPSplit(1) {
 
     initInstrumentList();
 
   }
 
-#if LLVM_MAJOR >= 11
-  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
-#else
-  bool runOnModule(Module &M) override;
-#endif
+  bool runOnModule(Module &M);
 
  private:
+  const std::unordered_set<BasicBlock*>& target_bb;
   int enableFPSplit;
 
-  unsigned target_bitwidth = 8;
+  unsigned target_bitwidth = 4;
 
   size_t count = 0;
 
@@ -177,55 +167,6 @@ class SplitComparesTransform : public ModulePass {
 
 }  // namespace
 
-#if LLVM_MAJOR >= 11
-extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
-llvmGetPassPluginInfo() {
-
-  return {LLVM_PLUGIN_API_VERSION, "splitcompares", "v0.1",
-          /* lambda to insert our pass into the pass pipeline. */
-          [](PassBuilder &PB) {
-
-  #if 1
-    #if LLVM_VERSION_MAJOR <= 13
-            using OptimizationLevel = typename PassBuilder::OptimizationLevel;
-    #endif
-            PB.registerOptimizerLastEPCallback(
-                [](ModulePassManager &MPM, OptimizationLevel OL) {
-
-                  MPM.addPass(SplitComparesTransform());
-
-                });
-
-  /* TODO LTO registration */
-  #else
-            using PipelineElement = typename PassBuilder::PipelineElement;
-            PB.registerPipelineParsingCallback([](StringRef          Name,
-                                                  ModulePassManager &MPM,
-                                                  ArrayRef<PipelineElement>) {
-
-              if (Name == "splitcompares") {
-
-                MPM.addPass(SplitComparesTransform());
-                return true;
-
-              } else {
-
-                return false;
-
-              }
-
-            });
-
-  #endif
-
-          }};
-
-}
-
-#else
-char SplitComparesTransform::ID = 0;
-#endif
-
 /// This function splits FCMP instructions with xGE or xLE predicates into two
 /// FCMP instructions with predicate xGT or xLT and EQ
 bool SplitComparesTransform::simplifyFPCompares(Module &M) {
@@ -241,6 +182,8 @@ bool SplitComparesTransform::simplifyFPCompares(Module &M) {
     if (!isInInstrumentList(&F, MNAME)) continue;
 
     for (auto &BB : F) {
+
+      if (target_bb.count(&BB) == 0) continue;
 
       for (auto &IN : BB) {
 
@@ -906,6 +849,8 @@ size_t SplitComparesTransform::splitFPCompares(Module &M) {
 
     for (auto &BB : F) {
 
+      if (target_bb.count(&BB) == 0) continue;
+
       for (auto &IN : BB) {
 
         CmpInst *selectcmpInst = nullptr;
@@ -1503,20 +1448,13 @@ size_t SplitComparesTransform::splitFPCompares(Module &M) {
 
 }
 
-#if LLVM_MAJOR >= 11
-PreservedAnalyses SplitComparesTransform::run(Module                &M,
-                                              ModuleAnalysisManager &MAM) {
-
-#else
 bool SplitComparesTransform::runOnModule(Module &M) {
-
-#endif
 
   char *bitw_env = getenv("AFL_LLVM_LAF_SPLIT_COMPARES_BITW");
   if (!bitw_env) bitw_env = getenv("LAF_SPLIT_COMPARES_BITW");
   if (bitw_env) { target_bitwidth = atoi(bitw_env); }
 
-  enableFPSplit = getenv("AFL_LLVM_LAF_SPLIT_FLOATS") != NULL;
+  enableFPSplit = getenv("AFL_LLVM_LAF_NO_SPLIT_FLOATS") == NULL;
 
   if ((isatty(2) && getenv("AFL_QUIET") == NULL) ||
       getenv("AFL_DEBUG") != NULL) {
@@ -1532,10 +1470,6 @@ bool SplitComparesTransform::runOnModule(Module &M) {
     be_quiet = 1;
 
   }
-
-#if LLVM_MAJOR >= 11
-  auto PA = PreservedAnalyses::all();
-#endif
 
   if (enableFPSplit) {
 
@@ -1560,6 +1494,8 @@ bool SplitComparesTransform::runOnModule(Module &M) {
 
     for (auto &BB : F) {
 
+      if (target_bb.count(&BB) == 0) continue;
+
       for (auto &IN : BB) {
 
         if (auto CI = dyn_cast<CmpInst>(&IN)) {
@@ -1568,11 +1504,7 @@ bool SplitComparesTransform::runOnModule(Module &M) {
           auto op1 = CI->getOperand(1);
           if (!op0 || !op1) {
 
-#if LLVM_MAJOR >= 11
-            return PA;
-#else
             return false;
-#endif
 
           }
 
@@ -1631,44 +1563,14 @@ bool SplitComparesTransform::runOnModule(Module &M) {
 
   }
 
-#if LLVM_MAJOR >= 11
-  /*  if (modified) {
-
-      PA.abandon<XX_Manager>();
-
-    }*/
-
-  return PA;
-#else
   return true;
-#endif
 
 }
 
-#if LLVM_MAJOR < 11                                 /* use old pass manager */
 
-static void registerSplitComparesPass(const PassManagerBuilder &,
-                                      legacy::PassManagerBase &PM) {
+void aflrun_laf_targets(
+  Module& M, const std::unordered_set<BasicBlock*>& target_bb) {
 
-  PM.add(new SplitComparesTransform());
+  SplitComparesTransform(target_bb).runOnModule(M);
 
 }
-
-static RegisterStandardPasses RegisterSplitComparesPass(
-    PassManagerBuilder::EP_OptimizerLast, registerSplitComparesPass);
-
-static RegisterStandardPasses RegisterSplitComparesTransPass0(
-    PassManagerBuilder::EP_EnabledOnOptLevel0, registerSplitComparesPass);
-
-  #if LLVM_VERSION_MAJOR >= 11
-static RegisterStandardPasses RegisterSplitComparesTransPassLTO(
-    PassManagerBuilder::EP_FullLinkTimeOptimizationLast,
-    registerSplitComparesPass);
-  #endif
-
-static RegisterPass<SplitComparesTransform> X("splitcompares",
-                                              "AFL++ split compares",
-                                              true /* Only looks at CFG */,
-                                              true /* Analysis Pass */);
-#endif
-

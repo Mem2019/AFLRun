@@ -80,17 +80,20 @@ endif
 #	SPECIAL_PERFORMANCE += -fno-move-loop-invariants -fdisable-tree-cunrolli
 #endif
 
-#ifeq "$(shell echo 'int main() {return 0; }' | $(CC) $(CFLAGS) -Werror -x c - -march=native -o .test 2>/dev/null && echo 1 || echo 0 ; rm -f .test )" "1"
-#  ifndef SOURCE_DATE_EPOCH
-#    HAVE_MARCHNATIVE = 1
-#    CFLAGS_OPT += -march=native
-#  endif
-#endif
+# Not sure why AVX is disabled, re-enabling
+# https://github.com/Mem2019/AFLRplusplus/commit/fe9da707058b3b2cb1812c3d635d3bb43fe33d13
+
+ifeq "$(shell echo 'int main() {return 0; }' | $(CC) $(CFLAGS) -Werror -x c - -march=native -o .test 2>/dev/null && echo 1 || echo 0 ; rm -f .test )" "1"
+ ifndef SOURCE_DATE_EPOCH
+   HAVE_MARCHNATIVE = 1
+   CFLAGS_OPT += -march=native
+ endif
+endif
 
 ifneq "$(SYS)" "Darwin"
-  #ifeq "$(HAVE_MARCHNATIVE)" "1"
-  #  SPECIAL_PERFORMANCE += -march=native
-  #endif
+  ifeq "$(HAVE_MARCHNATIVE)" "1"
+   SPECIAL_PERFORMANCE += -march=native
+  endif
  ifndef DEBUG
    CFLAGS_OPT += -D_FORTIFY_SOURCE=1
  endif
@@ -149,6 +152,23 @@ override CFLAGS += -g -Wno-pointer-sign -Wno-variadic-macros -Wall -Wextra -Wno-
 			-DBIN_PATH=\"$(BIN_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\"
 # -fstack-protector
 
+CXXFLAGS ?= -O2 $(CFLAGS_OPT)
+override CXXFLAGS += -g -Wall -std=c++14 -I robin-hood-hashing/src/include/ -I include/
+
+ifdef AFLRUN_CTX
+  override CFLAGS += -DAFLRUN_CTX
+  override CXXFLAGS += -DAFLRUN_CTX
+endif
+
+ifdef AFLRUN_CTX_DIV
+  override CXXFLAGS += -DAFLRUN_CTX_DIV
+endif
+
+ifdef AFLRUN_OVERHEAD
+  override CFLAGS += -DAFLRUN_OVERHEAD
+  override CXXFLAGS += -DAFLRUN_OVERHEAD
+endif
+
 ifeq "$(SYS)" "FreeBSD"
   override CFLAGS  += -I /usr/local/include/
   override LDFLAGS += -L /usr/local/lib/
@@ -178,29 +198,29 @@ endif
 
 AFL_FUZZ_FILES = $(wildcard src/afl-fuzz*.c)
 
-ifneq "$(shell command -v python3m 2>/dev/null)" ""
-  ifneq "$(shell command -v python3m-config 2>/dev/null)" ""
-    PYTHON_INCLUDE  ?= $(shell python3m-config --includes)
-    PYTHON_VERSION  ?= $(strip $(shell python3m --version 2>&1))
+ifneq "$(shell command -v python3 2>/dev/null)" ""
+  ifneq "$(shell command -v python3-config 2>/dev/null)" ""
+    PYTHON_INCLUDE  ?= $(shell python3-config --includes)
+    PYTHON_VERSION  ?= $(strip $(shell python3 --version 2>&1))
     # Starting with python3.8, we need to pass the `embed` flag. Earlier versions didn't know this flag.
-    ifeq "$(shell python3m-config --embed --libs 2>/dev/null | grep -q lpython && echo 1 )" "1"
-      PYTHON_LIB      ?= $(shell python3m-config --libs --embed --ldflags)
+    ifeq "$(shell python3-config --embed --libs 2>/dev/null | grep -q lpython && echo 1 )" "1"
+      PYTHON_LIB      ?= $(shell python3-config --libs --embed --ldflags)
     else
-      PYTHON_LIB      ?= $(shell python3m-config --ldflags)
+      PYTHON_LIB      ?= $(shell python3-config --ldflags)
     endif
   endif
 endif
 
 ifeq "$(PYTHON_INCLUDE)" ""
-  ifneq "$(shell command -v python3 2>/dev/null)" ""
-    ifneq "$(shell command -v python3-config 2>/dev/null)" ""
-      PYTHON_INCLUDE  ?= $(shell python3-config --includes)
-      PYTHON_VERSION  ?= $(strip $(shell python3 --version 2>&1))
-      # Starting with python3.8, we need to pass the `embed` flag. Earier versions didn't know this flag.
-      ifeq "$(shell python3-config --embed --libs 2>/dev/null | grep -q lpython && echo 1 )" "1"
-        PYTHON_LIB      ?= $(shell python3-config --libs --embed --ldflags)
+  ifneq "$(shell command -v python3m 2>/dev/null)" ""
+    ifneq "$(shell command -v python3m-config 2>/dev/null)" ""
+      PYTHON_INCLUDE  ?= $(shell python3m-config --includes)
+      PYTHON_VERSION  ?= $(strip $(shell python3m --version 2>&1))
+      # Starting with python3.8, we need to pass the `embed` flag. Earlier versions didn't know this flag.
+      ifeq "$(shell python3m-config --embed --libs 2>/dev/null | grep -q lpython && echo 1 )" "1"
+        PYTHON_LIB      ?= $(shell python3m-config --libs --embed --ldflags)
       else
-        PYTHON_LIB      ?= $(shell python3-config --ldflags)
+        PYTHON_LIB      ?= $(shell python3m-config --ldflags)
       endif
     endif
   endif
@@ -448,8 +468,11 @@ src/afl-forkserver.o : $(COMM_HDR) src/afl-forkserver.c include/forkserver.h
 src/afl-sharedmem.o : $(COMM_HDR) src/afl-sharedmem.c include/sharedmem.h
 	$(CC) $(CFLAGS) $(CFLAGS_FLTO) -c src/afl-sharedmem.c -o src/afl-sharedmem.o
 
-afl-fuzz: $(COMM_HDR) include/afl-fuzz.h $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o | test_x86
-	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(PYFLAGS) $(LDFLAGS) -lm
+src/aflrun.o : $(COMM_HDR) include/aflrun.h src/aflrun.cpp
+	$(CXX) $(CXXFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) src/aflrun.cpp -c -o src/aflrun.o
+
+afl-fuzz: $(COMM_HDR) include/aflrun.h include/afl-fuzz.h src/aflrun.o $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o | test_x86
+	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) $(AFL_FUZZ_FILES) src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o src/aflrun.o -o $@ $(PYFLAGS) $(LDFLAGS) -lm -lstdc++
 
 afl-showmap: src/afl-showmap.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $(COMPILE_STATIC) $(CFLAGS_FLTO) src/$@.c src/afl-common.o src/afl-sharedmem.o src/afl-forkserver.o src/afl-performance.o -o $@ $(LDFLAGS)
@@ -543,15 +566,15 @@ code-format:
 
 .PHONY: test_build
 ifndef AFL_NO_X86
-test_build: afl-cc afl-gcc afl-as afl-showmap
-	@echo "[*] Testing the CC wrapper afl-cc and its instrumentation output..."
-	@unset AFL_MAP_SIZE AFL_USE_UBSAN AFL_USE_CFISAN AFL_USE_LSAN AFL_USE_ASAN AFL_USE_MSAN; ASAN_OPTIONS=detect_leaks=0 AFL_INST_RATIO=100 AFL_PATH=. ./afl-cc test-instr.c $(LDFLAGS) -o test-instr 2>&1 || (echo "Oops, afl-cc failed"; exit 1 )
+test_build: afl-clang-lto afl-gcc afl-as afl-showmap
+	@echo "[*] Testing the CC wrapper afl-clang-lto and its instrumentation output..."
+	@unset AFL_MAP_SIZE AFL_USE_UBSAN AFL_USE_CFISAN AFL_USE_LSAN AFL_USE_ASAN AFL_USE_MSAN; ASAN_OPTIONS=detect_leaks=0 AFL_INST_RATIO=100 AFL_PATH=. ./afl-clang-lto test-instr.c $(LDFLAGS) -o test-instr 2>&1 || (echo "Oops, afl-clang-lto failed"; exit 1 )
 	ASAN_OPTIONS=detect_leaks=0 ./afl-showmap -m none -q -o .test-instr0 ./test-instr < /dev/null
 	echo 1 | ASAN_OPTIONS=detect_leaks=0 ./afl-showmap -m none -q -o .test-instr1 ./test-instr
 	@rm -f test-instr
-	@cmp -s .test-instr0 .test-instr1; DR="$$?"; rm -f .test-instr0 .test-instr1; if [ "$$DR" = "0" ]; then echo; echo "Oops, the instrumentation of afl-cc does not seem to be behaving correctly!"; echo; echo "Please post to https://github.com/AFLplusplus/AFLplusplus/issues to troubleshoot the issue."; echo; exit 1; fi
+	@cmp -s .test-instr0 .test-instr1; DR="$$?"; rm -f .test-instr0 .test-instr1; if [ "$$DR" = "0" ]; then echo; echo "Oops, the instrumentation of afl-clang-lto does not seem to be behaving correctly!"; echo; echo "Please post to https://github.com/AFLplusplus/AFLplusplus/issues to troubleshoot the issue."; echo; exit 1; fi
 	@echo
-	@echo "[+] All right, the instrumentation of afl-cc seems to be working!"
+	@echo "[+] All right, the instrumentation of afl-clang-lto seems to be working!"
 #	@echo "[*] Testing the CC wrapper afl-gcc and its instrumentation output..."
 #	@unset AFL_MAP_SIZE AFL_USE_UBSAN AFL_USE_CFISAN AFL_USE_LSAN AFL_USE_ASAN AFL_USE_MSAN; AFL_CC=$(CC) ASAN_OPTIONS=detect_leaks=0 AFL_INST_RATIO=100 AFL_PATH=. ./afl-gcc test-instr.c -o test-instr 2>&1 || (echo "Oops, afl-gcc failed"; exit 1 )
 #	ASAN_OPTIONS=detect_leaks=0 ./afl-showmap -m none -q -o .test-instr0 ./test-instr < /dev/null
@@ -563,7 +586,7 @@ test_build: afl-cc afl-gcc afl-as afl-showmap
 #	@echo
 #	@echo "[+] All right, the instrumentation of afl-gcc seems to be working!"
 else
-test_build: afl-cc afl-as afl-showmap
+test_build: afl-clang-lto afl-as afl-showmap
 	@echo "[!] Note: skipping build tests (you may need to use LLVM or QEMU mode)."
 endif
 

@@ -25,6 +25,7 @@
  */
 
 #include "afl-fuzz.h"
+#include "aflrun.h"
 #include <sys/time.h>
 #include <signal.h>
 #include <limits.h>
@@ -58,7 +59,23 @@ fuzz_run_target(afl_state_t *afl, afl_forkserver_t *fsrv, u32 timeout) {
 
 #endif
 
+  u64 t1 = get_cur_time_us();
+  u64 fuzz_time_cur = t1 - afl->last_exec_time;
+
   fsrv_run_result_t res = afl_fsrv_run_target(fsrv, timeout, &afl->stop_soon);
+
+  u64 t2 = get_cur_time_us();
+  u64 exec_time_cur = t2 - t1;
+  afl->last_exec_time = t2;
+
+  afl->exec_time += exec_time_cur;
+  afl->fuzz_time += fuzz_time_cur;
+  if (unlikely(afl->exec_time_short + afl->fuzz_time_short >
+      5 * 1000 * 1000)) {
+      afl->exec_time_short = afl->fuzz_time_short = 0;
+  }
+  afl->exec_time_short += exec_time_cur;
+  afl->fuzz_time_short += fuzz_time_cur;
 
 #ifdef PROFILING
   clock_gettime(CLOCK_REALTIME, &spec);
@@ -199,7 +216,7 @@ write_to_testcase(afl_state_t *afl, void **mem, u32 len, u32 fix) {
   char fn[PATH_MAX];
   snprintf(fn, PATH_MAX, "%s/mutations/%09u:%s", afl->out_dir,
            afl->document_counter++,
-           describe_op(afl, 0, NAME_MAX - strlen("000000000:")));
+           describe_op(afl, 0, 0, NAME_MAX - strlen("000000000:")));
 
   if ((doc_fd = open(fn, O_WRONLY | O_CREAT | O_TRUNC, DEFAULT_PERMISSION)) >=
       0) {
@@ -373,6 +390,46 @@ static void write_with_gap(afl_state_t *afl, u8 *mem, u32 len, u32 skip_at,
 
 }
 
+static void aflrun_new_bits(afl_state_t* afl, struct queue_entry* q) {
+
+  // Skip for following calibration of a new seed
+  if (q->tested == 2)
+    return;
+
+  if (q->tested == 0) {
+    // For imported case, we need to get its path for first calibration
+    aflrun_has_new_path(afl->fsrv.trace_freachables,
+      afl->fsrv.trace_reachables, afl->fsrv.trace_ctx,
+      afl->fsrv.trace_virgin->trace, afl->fsrv.trace_virgin->num,
+      0, q->id, NULL, NULL, 0); // For imported case, we don't do seed isolation.
+    q->path_cksum = hash64(afl->fsrv.trace_ctx,
+      MAP_TR_SIZE(afl->fsrv.num_reachables), HASH_CONST);
+    // xargs -I{} cp -u {} /tmp/in/
+    if (getenv("AFLRUN_TRACE_CORPUS")) {
+      u8* fn; int r;
+      aflrun_write_to_log(afl);
+
+      fn = alloc_printf("cp '%s/aflrun_fringe.txt' '%s/aflrun_fringe_%u.txt'",
+        afl->out_dir, afl->out_dir, q->id);
+      r = system(fn);
+      if (r) FATAL("cp failed");
+      ck_free(fn);
+      fn = alloc_printf("cp %s/aflrun_pro_fringe.txt %s/aflrun_pro_fringe_%u.txt",
+        afl->out_dir, afl->out_dir, q->id);
+      r = system(fn);
+      if (r) FATAL("cp failed");
+      ck_free(fn);
+      fn = alloc_printf("cp %s/aflrun_targets.txt %s/aflrun_targets_%u.txt",
+        afl->out_dir, afl->out_dir, q->id);
+      r = system(fn);
+      if (r) FATAL("cp failed");
+      ck_free(fn);
+    }
+  }
+
+  q->tested = 2;
+}
+
 /* Calibrate a new test case. This is done when processing the input directory
    to warn about flaky or otherwise problematic test cases early on; and when
    new paths are discovered to detect variable behavior and so on. */
@@ -464,6 +521,18 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
     hnb = has_new_bits(afl, afl->virgin_bits);
     if (hnb > new_bits) { new_bits = hnb; }
 
+    // If `exec_cksum` is non-zero, `calibrate_case` must come from
+    // `save_if_interesting`, which means we can use `afl->virgins` directly.
+    // If it comes from timeout seeds, it is not supposed to be updated to
+    // aflrun, so there should be no diversity maps, so `has_new_bits` should
+    // be same as `has_new_bits_mul`; if it comes from interesting seeds,
+    // `afl->virgin_bits` should already be updated by `afl->fsrv.trace_bits`,
+    // so `has_new_bits` here does not do anything.
+
+    // Otherwise, it can come from either calibration failure or seed import,
+    // which we are going to handle after the first run of calibration.
+    // e.i. ensure the seed to be updated to aflrun.
+
   }
 
   start_us = get_cur_time_us();
@@ -480,17 +549,24 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
     (void)write_to_testcase(afl, (void **)&use_mem, q->len, 1);
 
+    if (q->tested == 0)
+      afl->fsrv.testing = 1;
     fault = fuzz_run_target(afl, &afl->fsrv, use_tmout);
+    afl->fsrv.testing = 0;
 
     /* afl->stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
 
-    if (afl->stop_soon || fault != afl->crash_mode) { goto abort_calibration; }
+    if (afl->stop_soon || fault != afl->crash_mode) {
+      aflrun_recover_virgin(afl);
+      goto abort_calibration;
+    }
 
     if (!afl->non_instrumented_mode && !afl->stage_cur &&
         !count_bytes(afl, afl->fsrv.trace_bits)) {
 
       fault = FSRV_RUN_NOINST;
+      aflrun_recover_virgin(afl);
       goto abort_calibration;
 
     }
@@ -501,10 +577,34 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
     classify_counts(&afl->fsrv);
     cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+
+    aflrun_new_bits(afl, q);
+
+    // At this point the new seed must have been updated to aflrun,
+    // so we can get its virgin maps from its target reaching information
+    if (!afl->stage_cur && first_run) {
+
+      size_t n = aflrun_max_clusters(q->id);
+      afl->virgins = afl_realloc((void **)&afl->virgins, sizeof(u8*) * n);
+      afl->clusters = afl_realloc((void **)&afl->clusters, sizeof(size_t) * n);
+      afl->virgins[0] = afl->virgin_bits;
+      afl->clusters[0] = 0;
+      afl->num_maps = aflrun_get_seed_virgins(
+        q->id, afl->virgins + 1, afl->clusters + 1) + 1;
+
+      /*/ DEBUG
+      printf("Clusters(calibration): ");
+      for (size_t i = 0; i < afl->num_maps; ++i) {
+        printf("%u ", afl->clusters[i]);
+      }
+      printf("\n");
+      // DEBUG*/
+    }
+
     if (q->exec_cksum != cksum) {
 
-      hnb = has_new_bits(afl, afl->virgin_bits);
-      if (hnb > new_bits) { new_bits = hnb; }
+      hnb = has_new_bits_mul(afl, afl->virgins, &afl->new_bits, afl->num_maps, 1);
+      if ((hnb & 3) > new_bits) { new_bits = hnb & 3; }
 
       if (q->exec_cksum) {
 
@@ -517,7 +617,8 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
             afl->var_bytes[i] = 1;
             // ignore the variable edge by setting it to fully discovered
-            afl->virgin_bits[i] = 0;
+            for (size_t j = 0; j < afl->num_maps; ++j)
+              afl->virgins[j][i] = 0;
 
           }
 
@@ -587,6 +688,7 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
   ++afl->total_bitmap_entries;
 
   update_bitmap_score(afl, q);
+  aflrun_update_fringe_score(q->id);
 
   /* If this case didn't result in new output from the instrumentation, tell
      parent. This is a non-critical problem, but something to warn the user
@@ -627,6 +729,18 @@ abort_calibration:
   afl->stage_max = old_sm;
 
   if (!first_run) { show_stats(afl); }
+
+  // This commit can commit sequences from both `save_if_interesting` and
+  // `calibrate_case`, even if calibration fails; but the sequences can be
+  // empty here due to `+path` only seeds, so we must handle this inside it.
+  /*/ DEBUG
+  printf("Commit: ");
+  for (size_t i = 0; i < afl->num_maps; ++i) {
+    printf("%u ", afl->clusters[i]);
+  }
+  printf("\n");
+  // DEBUG*/
+  aflrun_commit_bit_seqs(afl->clusters, afl->num_maps);
 
   return fault;
 
@@ -791,13 +905,18 @@ void sync_fuzzers(afl_state_t *afl) {
 
         (void)write_to_testcase(afl, (void **)&mem, st.st_size, 1);
 
+        afl->fsrv.testing = 1;
         fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+        afl->fsrv.testing = 0;
 
-        if (afl->stop_soon) { goto close_sync; }
+        if (afl->stop_soon) {
+          aflrun_recover_virgin(afl);
+          goto close_sync;
+        }
 
         afl->syncing_party = sd_ent->d_name;
         afl->queued_imported +=
-            save_if_interesting(afl, mem, st.st_size, fault);
+            save_if_interesting(afl, mem, st.st_size, fault, 0);
         afl->syncing_party = 0;
 
         munmap(mem, st.st_size);
@@ -918,7 +1037,7 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
     while (remove_pos < q->len) {
 
       u32 trim_avail = MIN(remove_len, q->len - remove_pos);
-      u64 cksum;
+      u64 cksum, pcksum;
 
       write_with_gap(afl, in_buf, q->len, remove_pos, trim_avail);
 
@@ -932,13 +1051,15 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
       ++afl->trim_execs;
       classify_counts(&afl->fsrv);
       cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+      pcksum = hash64(
+        afl->fsrv.trace_ctx, MAP_TR_SIZE(afl->fsrv.num_reachables), HASH_CONST);
 
       /* If the deletion had no impact on the trace, make it permanent. This
          isn't perfect for variable-path inputs, but we're just making a
          best-effort pass, so it's not a big deal if we end up with false
          negatives every now and then. */
 
-      if (cksum == q->exec_cksum) {
+      if (cksum == q->exec_cksum && pcksum == q->path_cksum) {
 
         u32 move_tail = q->len - remove_pos - trim_avail;
 
@@ -1013,6 +1134,7 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
 
     memcpy(afl->fsrv.trace_bits, afl->clean_trace, afl->fsrv.map_size);
     update_bitmap_score(afl, q);
+    aflrun_update_fringe_score(q->id);
 
   }
 
@@ -1038,15 +1160,24 @@ common_fuzz_stuff(afl_state_t *afl, u8 *out_buf, u32 len) {
 
   }
 
+  ++afl->fuzzed_times;
+  ++afl->queue_cur->fuzzed_times;
+  afl->fsrv.testing = 1;
   fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+  afl->fsrv.testing = 0;
+  ++afl->total_perf_score;
 
-  if (afl->stop_soon) { return 1; }
+  if (afl->stop_soon) {
+    aflrun_recover_virgin(afl);
+    return 1;
+  }
 
   if (fault == FSRV_RUN_TMOUT) {
 
     if (afl->subseq_tmouts++ > TMOUT_LIMIT) {
 
       ++afl->cur_skipped_items;
+      aflrun_recover_virgin(afl);
       return 1;
 
     }
@@ -1064,13 +1195,14 @@ common_fuzz_stuff(afl_state_t *afl, u8 *out_buf, u32 len) {
 
     afl->skip_requested = 0;
     ++afl->cur_skipped_items;
+    aflrun_recover_virgin(afl);
     return 1;
 
   }
 
   /* This handles FAULT_ERROR for us: */
 
-  afl->queued_discovered += save_if_interesting(afl, out_buf, len, fault);
+  afl->queued_discovered += save_if_interesting(afl, out_buf, len, fault, 1);
 
   if (!(afl->stage_cur % afl->stats_update_freq) ||
       afl->stage_cur + 1 == afl->stage_max) {
@@ -1083,3 +1215,13 @@ common_fuzz_stuff(afl_state_t *afl, u8 *out_buf, u32 len) {
 
 }
 
+void aflrun_recover_virgin(afl_state_t* afl) {
+  u8* virgin_ctx = afl->virgin_ctx;
+  const ctx_t* new_paths = afl->fsrv.trace_virgin->trace;
+  size_t len = afl->fsrv.trace_virgin->num;
+  // Reset the virgin bits
+  for (size_t i = 0; i < len; ++i) {
+    size_t idx = CTX_IDX(new_paths[i].block, new_paths[i].call_ctx);
+    virgin_ctx[idx / 8] |= 1 << (idx % 8);
+  }
+}

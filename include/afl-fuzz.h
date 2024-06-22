@@ -48,6 +48,7 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -163,6 +164,7 @@ struct queue_entry {
       has_new_cov,                      /* Triggers new coverage?           */
       var_behavior,                     /* Variable behavior?               */
       favored,                          /* Currently favored?               */
+      div_favored,                      /* Currently favored for diversity? */
       fs_redundant,                     /* Marked as redundant in the fs?   */
       is_ascii,                         /* Is the input just ascii text?    */
       disabled;                         /* Is disabled from fuzz selection  */
@@ -184,6 +186,7 @@ struct queue_entry {
       handicap,                         /* Number of queue cycles behind    */
       depth,                            /* Path depth                       */
       exec_cksum,                       /* Checksum of the execution trace  */
+      fuzzed_times,                     /* Number of times being tested     */
       stats_mutated;                    /* stats: # of mutations performed  */
 
   u8 *trace_mini;                       /* Trace bytes, if kept             */
@@ -193,7 +196,7 @@ struct queue_entry {
   u32 bitsmap_size;
 #endif
 
-  double perf_score,                    /* performance score                */
+  double perf_score, quant_score,       /* performance score for afl(run)    */
       weight;
 
   u8 *testcase_buf;                     /* The testcase buffer, if loaded.  */
@@ -202,6 +205,16 @@ struct queue_entry {
   struct tainted *taint;                /* Taint information from CmpLog    */
 
   struct queue_entry *mother;           /* queue entry this based on        */
+
+  /* 0: not tested (e.g. first calibration for imported seed);
+    1: partially tested (e.g. first calibration for mutated seed);
+    2: fully tested (e.g. non-first time calibration) */
+  u8 tested;
+
+  /* --- Used only in multiple-path mode --- */
+  u64 path_cksum;
+
+  u8 aflrun_extra;
 
 };
 
@@ -430,6 +443,7 @@ typedef struct afl_state {
 
   afl_forkserver_t fsrv;
   sharedmem_t      shm;
+  aflrun_shm_t shm_run;
   sharedmem_t     *shm_fuzz;
   afl_env_vars_t   afl_env;
 
@@ -538,7 +552,11 @@ typedef struct afl_state {
 
   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
       *virgin_tmout,                    /* Bits we haven't seen in tmouts   */
-      *virgin_crash;                    /* Bits we haven't seen in crashes  */
+      *virgin_crash,                    /* Bits we haven't seen in crashes  */
+      *virgin_reachables,               /* Similar to virgin_bits, but for
+                                                  reachable basic blocks */
+      *virgin_freachables,              /* Same as above but for functions  */
+      *virgin_ctx;                      /* Virgin bits for context-sensitive */
 
   double *alias_probability;            /* alias weighted probabilities     */
   u32    *alias_table;                /* alias weighted random lookup table */
@@ -559,6 +577,9 @@ typedef struct afl_state {
       queued_imported,                  /* Items imported via -S            */
       queued_favored,                   /* Paths deemed favorable           */
       queued_with_cov,                  /* Paths with new coverage bytes    */
+      queued_extra,                     /* Number of extra seeds of aflrun  */
+      queued_extra_disabled,            /* Number of extra seeds disabled   */
+      queued_aflrun,                    /* Number of seeds in aflrun queue  */
       pending_not_fuzzed,               /* Queued but not done yet          */
       pending_favored,                  /* Pending favored paths            */
       cur_skipped_items,                /* Abandoned inputs in cur cycle    */
@@ -568,7 +589,8 @@ typedef struct afl_state {
       var_byte_count,                   /* Bitmap bytes with var behavior   */
       current_entry,                    /* Current queue entry ID           */
       havoc_div,                        /* Cycle count divisor for havoc    */
-      max_det_extras;                   /* deterministic extra count (dicts)*/
+      max_det_extras,                   /* deterministic extra count (dicts)*/
+      aflrun_favored;                   /* Num of seeds selected by aflrun  */
 
   u64 total_crashes,                    /* Total number of crashes          */
       saved_crashes,                    /* Crashes with unique signatures   */
@@ -778,6 +800,45 @@ typedef struct afl_state {
   u32   bitsmap_size;
 #endif
 
+  u64 exec_time, fuzz_time, exec_time_short, fuzz_time_short, last_exec_time;
+
+  u32 fuzzed_times;          /* Number of times common_fuzz_stuff is called */
+
+  reach_t** reachable_to_targets;/* Map from reachable index to array
+                                          of targets to which it can reach*/
+  reach_t* reachable_to_size;    /* Map from index to array size */
+  char** reachable_names;
+  double* target_weights;
+
+  u64 total_perf_score;
+
+  struct queue_entry** aflrun_queue; /* Queue for fuzzing in order */
+  u32 aflrun_idx; /* `current_entry` for aflrun queue */
+  u32* aflrun_seeds; /* Map seed to its `fuzz_level` value */
+  double* perf_scores;
+
+  u8 force_cycle_end, is_aflrun;
+  double quantum_ratio;   /* actual quantum / planned quantum*/
+
+  u8** virgins; size_t* clusters;
+  struct queue_entry*** tops;
+  u8* new_bits;
+  size_t num_maps;
+  u8 div_score_changed;
+
+#ifdef USE_PYTHON
+  PyObject* aflrun_assign_energy;
+  PyObject* aflrun_assign_seed;
+#endif
+
+  u32 runs_in_current_cycle;
+  u32 min_num_exec;
+  u8 check_at_begin, log_at_begin;
+  u64 log_check_interval;
+  double trim_thr, queue_quant_thr;
+
+  char* temp_dir;
+
 } afl_state_t;
 
 struct custom_mutator {
@@ -826,7 +887,8 @@ struct custom_mutator {
    * @param buf_size Size of the test case
    * @return The amount of fuzzes to perform on this queue entry, 0 = skip
    */
-  u32 (*afl_custom_fuzz_count)(void *data, const u8 *buf, size_t buf_size);
+  u32 (*afl_custom_fuzz_count)(
+    void *data, const u8 *buf, size_t buf_size, u32 saved_max);
 
   /**
    * Perform custom mutations on a given input
@@ -1088,11 +1150,11 @@ void discover_word(u8 *ret, u32 *current, u32 *virgin);
 void init_count_class16(void);
 void minimize_bits(afl_state_t *, u8 *, u8 *);
 #ifndef SIMPLE_FILES
-u8 *describe_op(afl_state_t *, u8, size_t);
+u8 *describe_op(afl_state_t *, u8, u8, size_t);
 #endif
-u8 save_if_interesting(afl_state_t *, void *, u32, u8);
+u8 save_if_interesting(afl_state_t *, void *, u32, u8, u8);
 u8 has_new_bits(afl_state_t *, u8 *);
-u8 has_new_bits_unclassified(afl_state_t *, u8 *);
+u8 has_new_bits_mul(afl_state_t *, u8* const *, u8**, size_t, u8);
 
 /* Extras */
 
@@ -1117,6 +1179,7 @@ void show_stats(afl_state_t *);
 void show_stats_normal(afl_state_t *);
 void show_stats_pizza(afl_state_t *);
 void show_init_stats(afl_state_t *);
+void aflrun_write_to_log(afl_state_t *);
 
 /* StatsD */
 
@@ -1133,6 +1196,7 @@ u8   calibrate_case(afl_state_t *, struct queue_entry *, u8 *, u32, u8);
 u8   trim_case(afl_state_t *, struct queue_entry *, u8 *);
 u8   common_fuzz_stuff(afl_state_t *, u8 *, u32);
 fsrv_run_result_t fuzz_run_target(afl_state_t *, afl_forkserver_t *fsrv, u32);
+void aflrun_recover_virgin(afl_state_t* afl);
 
 /* Fuzz one */
 
@@ -1173,6 +1237,8 @@ void   save_cmdline(afl_state_t *, u32, char **);
 void   read_foreign_testcases(afl_state_t *, int);
 void   write_crash_readme(afl_state_t *afl);
 u8     check_if_text_buf(u8 *buf, u32 len);
+char* aflrun_find_temp(char* temp_dir);
+void aflrun_temp_dir_init(afl_state_t* afl, const char* temp_dir);
 
 /* CmpLog */
 
@@ -1289,6 +1355,8 @@ void queue_testcase_retake_mem(afl_state_t *afl, struct queue_entry *q, u8 *in,
 /* Add a new queue entry directly to the cache */
 
 void queue_testcase_store_mem(afl_state_t *afl, struct queue_entry *q, u8 *mem);
+u32 select_aflrun_seeds(afl_state_t *afl);
+int cmp_quant_score(const void* a, const void* b);
 
 #if TESTCASE_CACHE == 1
   #error define of TESTCASE_CACHE must be zero or larger than 1
