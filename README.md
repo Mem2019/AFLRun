@@ -59,7 +59,7 @@ export CC="$AFLRUN/afl-clang-lto"
 export CXX="$AFLRUN/afl-clang-lto++"
 ```
 
-# Citation
+## Citation
 
 ```bibtex
 @article{Rong2023TowardUM,
