@@ -58,3 +58,15 @@ export AFLRUN_TMP="/tmp/"
 export CC="$AFLRUN/afl-clang-lto"
 export CXX="$AFLRUN/afl-clang-lto++"
 ```
+
+# Citation
+
+```bibtex
+@article{Rong2023TowardUM,
+  title={Toward Unbiased Multiple-Target Fuzzing with Path Diversity},
+  author={Huanyao Rong and Wei You and Xiaofeng Wang and Tianhao Mao},
+  journal={ArXiv},
+  year={2023},
+  volume={abs/2310.12419}
+}
+```
